@@ -20,9 +20,9 @@ train_tf = T.Compose(
     [
         T.Resize(256),
         T.CenterCrop(224),
-        T.RandomRotation(180),
+        T.RandomRotation(degrees = 180, interpolation=T.InterpolationMode.BILINEAR, fill=(255, 255, 255)),  # white
         T.RandomHorizontalFlip(0.5),
-        T.ColorJitter(0.3, 0.5, 0.3, 0.1),
+        T.ColorJitter(0.3, 0.5, 0.3, 0.0),
         T.ToTensor(),
         T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
     ]

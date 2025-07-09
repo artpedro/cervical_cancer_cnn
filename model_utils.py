@@ -3,6 +3,7 @@ from torch import nn
 import timm
 import torchvision.models as tvm
 
+
 # Adapt model for binary classification
 def _adapt_head(model: nn.Module, num_classes: int = 2) -> int:
     """
@@ -34,10 +35,11 @@ def _adapt_head(model: nn.Module, num_classes: int = 2) -> int:
     #   • restoring this block lets us adapt any timm model in one call
     # ---------------------------------------------------------------------
     if hasattr(model, "reset_classifier"):
-        old_head = model.get_classifier()         # works for both CNN & ViT
-        in_feats = getattr(old_head, "in_features", 
-                           getattr(old_head, "in_channels", None))
-        model.reset_classifier(num_classes)       # timm creates new nn.Linear
+        old_head = model.get_classifier()  # works for both CNN & ViT
+        in_feats = getattr(
+            old_head, "in_features", getattr(old_head, "in_channels", None)
+        )
+        model.reset_classifier(num_classes)  # timm creates new nn.Linear
         return in_feats
 
     # ---------------------------------------------------------------------
@@ -83,6 +85,7 @@ def _adapt_head(model: nn.Module, num_classes: int = 2) -> int:
     # ---------------------------------------------------------------------
     raise RuntimeError("Could not find a Linear/Conv2d classification head.")
 
+
 def load_any(name: str, num_classes: int = 2, pretrained: bool = True):
     """
     Load a backbone by name from timm, torchvision or PyTorch Hub and adapt it
@@ -98,24 +101,24 @@ def load_any(name: str, num_classes: int = 2, pretrained: bool = True):
     # torchvision
     if model is None:
         tv_registry = {
-            "tv_squeezenet1_1":      tvm.squeezenet1_1,
+            "tv_squeezenet1_1": tvm.squeezenet1_1,
             "tv_shufflenet_v2_x1_0": tvm.shufflenet_v2_x1_0,
-            "tv_mobilenet_v2":       tvm.mobilenet_v2,
-            "mobilenetv2_100":       tvm.mobilenet_v2,
+            "tv_mobilenet_v2": tvm.mobilenet_v2,
+            "mobilenetv2_100": tvm.mobilenet_v2,
         }
         tv_ctor = tv_registry.get(name)
         if tv_ctor:
-            weights = (tv_ctor.Weights.DEFAULT             # torchvision ≥0.15
-                       if pretrained and hasattr(tv_ctor, "Weights")
-                       else None)
+            weights = (
+                tv_ctor.Weights.DEFAULT  # torchvision ≥0.15
+                if pretrained and hasattr(tv_ctor, "Weights")
+                else None
+            )
             model = tv_ctor(weights=weights)
             origin = f"torchvision:{name}"
 
     # PyTorch
     if model is None and name.startswith("ghostnet"):
-        model = torch.hub.load("pytorch/vision",
-                               "ghostnet_1x",
-                               pretrained=pretrained)
+        model = torch.hub.load("pytorch/vision", "ghostnet_1x", pretrained=pretrained)
         origin = "hub:ghostnet"
 
     if model is None:

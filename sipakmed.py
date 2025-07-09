@@ -65,7 +65,9 @@ def download_sipakmed(data_dir: Path) -> Path:
     else:
         print("Downloading dataset...")
         slug = "prahladmehandiratta/cervical-cancer-largest-dataset-sipakmed"
-        raw_path = kagglehub.dataset_download(slug)  # downloads + unzips under ~/.cache/kagglehub/…
+        raw_path = kagglehub.dataset_download(
+            slug
+        )  # downloads + unzips under ~/.cache/kagglehub/…
         print("Downloaded to :", raw_path)
 
         # Move/rename
@@ -73,9 +75,10 @@ def download_sipakmed(data_dir: Path) -> Path:
             shutil.rmtree(final_path)
         shutil.copytree(raw_path, final_path)
         print("Dataset ready at:", final_path)
-          
+
         assert final_path.exists(), f"Missing folder: {final_path}"
         return final_path
+
 
 def scan_sipakmed(root: Path, num_folds: int, seed: int) -> pd.DataFrame:
     """
@@ -100,6 +103,7 @@ def scan_sipakmed(root: Path, num_folds: int, seed: int) -> pd.DataFrame:
         df.loc[val_idx, "fold"] = i
     return df
 
+
 def compute_class_weights(df: pd.DataFrame, device: torch.device) -> torch.Tensor:
     """
     Compute inverse-frequency weights for binary classes.
@@ -107,7 +111,7 @@ def compute_class_weights(df: pd.DataFrame, device: torch.device) -> torch.Tenso
     freq = df["binary_idx"].value_counts(normalize=True).sort_index()
     if freq.size != 2:
         raise ValueError("Expected two classes, got " + str(freq.to_dict()))
-    return torch.tensor([1 / freq[0], 1 / freq[1]],dtype=torch.float32, device=device)
+    return torch.tensor([1 / freq[0], 1 / freq[1]], dtype=torch.float32, device=device)
 
 
 def get_sipakmed_loaders(

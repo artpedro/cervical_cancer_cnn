@@ -98,6 +98,16 @@ def metrics_binary(y_true, y_pred) -> dict[str, float]:
     }
 
 
+def compute_class_weights(df: pd.DataFrame, device: torch.device) -> torch.Tensor:
+    """
+    Compute inverse-frequency weights for binary classes.
+    """
+    freq = df["binary_idx"].value_counts(normalize=True).sort_index()
+    if freq.size != 2:
+        raise ValueError("Expected two classes, got " + str(freq.to_dict()))
+    return torch.tensor([1 / freq[0], 1 / freq[1]], dtype=torch.float32, device=device)
+
+
 # ----------------------------
 # Epoch runner
 # ----------------------------

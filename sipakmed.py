@@ -20,7 +20,11 @@ train_tf = T.Compose(
     [
         T.Resize(256),
         T.CenterCrop(224),
-        T.RandomRotation(degrees = 180, interpolation=T.InterpolationMode.BILINEAR, fill=(255, 255, 255)),  # white
+        T.RandomRotation(
+            degrees=180,
+            interpolation=T.InterpolationMode.BILINEAR,
+            fill=(255, 255, 255),
+        ),  # white
         T.RandomHorizontalFlip(0.5),
         T.ColorJitter(0.3, 0.5, 0.3, 0.0),
         T.ToTensor(),
@@ -51,6 +55,57 @@ class SipakBinaryDataset(Dataset):
         return self.tf(img), int(self.df.binary_idx[idx])
 
 
+# Scanning and fold assignment
+def scan_sipakmed(root: Path, num_folds: int, seed: int) -> pd.DataFrame:
+    """
+    Walk root/**/CROPPED/*.bmp, build DataFrame with:
+      - path, label_full, binary_label, binary_idx, fold
+    """
+    records = []
+    for cls_dir in sorted(p for p in root.iterdir() if p.is_dir()):
+        label = cls_dir.name.replace("im_", "")
+        for img in cls_dir.glob("**/CROPPED/*.bmp"):
+            records.append((str(img), label))
+
+    df = pd.DataFrame(records, columns=["path", "label_full"])
+    df["binary_label"] = df["label_full"].apply(
+        lambda x: "normal" if x in NORMAL else "abnormal"
+    )
+    df["binary_idx"] = df["binary_label"].map({"normal": 0, "abnormal": 1})
+
+    skf = StratifiedKFold(n_splits=num_folds, shuffle=True, random_state=seed)
+    df["fold"] = -1
+    for i, (_, val_idx) in enumerate(skf.split(df, df["binary_idx"])):
+        df.loc[val_idx, "fold"] = i
+    return df
+
+
+# Get loaders for SIPaKMeD dataset
+def get_sipakmed_loaders(
+    df: pd.DataFrame, fold: int, batch_size: int, num_workers: int, pin_memory: bool
+) -> tuple[DataLoader, DataLoader]:
+    """
+    Split df by fold and return (train_loader, val_loader).
+    """
+    train_df = df[df.fold != fold]
+    val_df = df[df.fold == fold]
+    train_loader = DataLoader(
+        SipakBinaryDataset(train_df, train_tf),
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+    )
+    val_loader = DataLoader(
+        SipakBinaryDataset(val_df, val_tf),
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+    )
+    return train_loader, val_loader
+
+
 def download_sipakmed(data_dir: Path) -> Path:
     """
     Download SIPaKMeD from Kaggle and unpack into data_dir/sipakmed.
@@ -78,62 +133,3 @@ def download_sipakmed(data_dir: Path) -> Path:
 
         assert final_path.exists(), f"Missing folder: {final_path}"
         return final_path
-
-
-def scan_sipakmed(root: Path, num_folds: int, seed: int) -> pd.DataFrame:
-    """
-    Walk root/**/CROPPED/*.bmp, build DataFrame with:
-      - path, label_full, binary_label, binary_idx, fold
-    """
-    records = []
-    for cls_dir in sorted(p for p in root.iterdir() if p.is_dir()):
-        label = cls_dir.name.replace("im_", "")
-        for img in cls_dir.glob("**/CROPPED/*.bmp"):
-            records.append((str(img), label))
-
-    df = pd.DataFrame(records, columns=["path", "label_full"])
-    df["binary_label"] = df["label_full"].apply(
-        lambda x: "normal" if x in NORMAL else "abnormal"
-    )
-    df["binary_idx"] = df["binary_label"].map({"normal": 0, "abnormal": 1})
-
-    skf = StratifiedKFold(n_splits=num_folds, shuffle=True, random_state=seed)
-    df["fold"] = -1
-    for i, (_, val_idx) in enumerate(skf.split(df, df["binary_idx"])):
-        df.loc[val_idx, "fold"] = i
-    return df
-
-
-def compute_class_weights(df: pd.DataFrame, device: torch.device) -> torch.Tensor:
-    """
-    Compute inverse-frequency weights for binary classes.
-    """
-    freq = df["binary_idx"].value_counts(normalize=True).sort_index()
-    if freq.size != 2:
-        raise ValueError("Expected two classes, got " + str(freq.to_dict()))
-    return torch.tensor([1 / freq[0], 1 / freq[1]], dtype=torch.float32, device=device)
-
-
-def get_sipakmed_loaders(
-    df: pd.DataFrame, fold: int, batch_size: int, num_workers: int, pin_memory: bool
-) -> tuple[DataLoader, DataLoader]:
-    """
-    Split df by fold and return (train_loader, val_loader).
-    """
-    train_df = df[df.fold != fold]
-    val_df = df[df.fold == fold]
-    train_loader = DataLoader(
-        SipakBinaryDataset(train_df, train_tf),
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-    )
-    val_loader = DataLoader(
-        SipakBinaryDataset(val_df, val_tf),
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-    )
-    return train_loader, val_loader

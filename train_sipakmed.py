@@ -61,16 +61,12 @@ SCHEDULER_GAMMA = 0.1
 EPS = 1e-9
 
 TODO = {
-    #    "SqueezeNet 1.1": "tv_squeezenet1_1",
+    "SqueezeNet 1.1": "tv_squeezenet1_1",
     "MobileNet V2 1.0x": "mobilenetv2_100",
     "MobileNet V4 small": "mobilenetv4_conv_small.e2400_r224_in1k",
-    #    "VIT-Little": "vit_little_patch16_reg4_gap_256.sbb_in1k",
-    #    "GhostNet V3": "hf_hub:timm/ghostnetv3_100.in1k",
-    #    "EfficientNet-B0": "hf_hub:timm/efficientnet_b0.ra_in1k",
-    #    "EfficientNet-B1": "hf_hub:timm/efficientnet_b1.ft_in1k",
-    #    "EfficientNet-B2": "hf_hub:timm/efficientnet_b2.ra_in1k",
-    #    "EfficientNet-B3": "hf_hub:timm/efficientnet_b3.ra_in1k",
-    #    "ShuffleNet V2 1.0x": "tv_shufflenet_v2_x1_0",
+    "ShuffleNet V2 1.0x": "tv_shufflenet_v2_x1_0",
+    "GhostNet V3": "hf_hub:timm/ghostnetv3_100.in1k",
+    **{f"EfficientNet-B{i}": f"efficientnet_b{i}" for i in range(9)},
 }
 
 # ----------------------------

@@ -31,7 +31,7 @@ train_tf = T.Compose(
             fill=(255, 255, 255),
         ),  # white
         T.RandomHorizontalFlip(0.5),
-        T.ColorJitter(0.3, 0.5, 0.3, 0.0),
+        T.ColorJitter(0.2, 0.2, 0.2, 0.0),
         T.ToTensor(),
         T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
     ]

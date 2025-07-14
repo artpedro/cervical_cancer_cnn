@@ -26,7 +26,7 @@ train_tf = T.Compose(
             fill=(255, 255, 255),
         ),  # white
         T.RandomHorizontalFlip(0.5),
-        T.ColorJitter(0.3, 0.5, 0.3, 0.0),
+        T.ColorJitter(0.2, 0.2, 0.2, 0.0),
         T.ToTensor(),
         T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
     ]
@@ -43,7 +43,7 @@ val_tf = T.Compose(
 
 
 # Dataset class
-class SipakBinaryDataset(Dataset):
+class SipakmedDataset(Dataset):
     def __init__(self, df: pd.DataFrame, tf):
         self.df, self.tf = df.reset_index(drop=True), tf
 
@@ -90,14 +90,14 @@ def get_sipakmed_loaders(
     train_df = df[df.fold != fold]
     val_df = df[df.fold == fold]
     train_loader = DataLoader(
-        SipakBinaryDataset(train_df, train_tf),
+        SipakmedDataset(train_df, train_tf),
         batch_size=batch_size,
         shuffle=True,
         num_workers=num_workers,
         pin_memory=pin_memory,
     )
     val_loader = DataLoader(
-        SipakBinaryDataset(val_df, val_tf),
+        SipakmedDataset(val_df, val_tf),
         batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,

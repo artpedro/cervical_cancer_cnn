@@ -8,7 +8,6 @@ import numpy as np
 
 from sipakmed import (
     scan_sipakmed,
-    compute_class_weights,
     get_sipakmed_loaders,
 )
 
@@ -22,12 +21,12 @@ from apacc import (
     get_apacc_loaders
 )
 
-from model_utils import load_any
 
 # Models
 import torch, torch.nn as nn
 from torch.utils.data import DataLoader
 from torch.optim.lr_scheduler import MultiStepLR
+from model_utils import load_any
 
 # Metrics
 from sklearn.metrics import (
@@ -180,6 +179,7 @@ def _init_csv_logger(run_dir: Path):
     w = csv.writer(f)
     w.writerow(
         [
+            "dataset"
             "model",
             "origin",
             "epoch",
@@ -246,7 +246,7 @@ def main():
                 )
 
                 best_val = {
-                    k: 0.0 for k in ["name","acc", "prec", "rec", "spec", "f1", "ppv", "npv"]
+                    k: 0.0 for k in ["dataset","acc", "prec", "rec", "spec", "f1", "ppv", "npv"]
                 }
                 best_val["epoch"] = 0
 

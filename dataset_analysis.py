@@ -18,6 +18,15 @@ from apacc import (
     val_tf,
 )
 
+def without_normalize(tf: T.Compose) -> T.Compose:
+    """Return a copy of a Compose transform with the final Normalize removed."""
+    ops = list(tf.transforms)
+    if isinstance(ops[-1], T.Normalize):
+        ops = ops[:-1]                      # drop it
+    return T.Compose(ops)
+
+train_tf_no_norm = without_normalize(train_tf)   # uses your Resize/Crop/Jitter…
+val_tf_no_norm   = without_normalize(val_tf)
 
 # --------------------------------------------------------------------------
 #  1.  Textual class-balance report
@@ -40,6 +49,78 @@ def report_class_balance(df: pd.DataFrame, num_folds: int) -> None:
         val   = trainval.query("fold == @f").binary_idx.value_counts().sort_index()
         print(f"Fold {f}  train: {pretty(train):15s}  |  val: {pretty(val)}")
 
+import torch
+from torch.utils.data import DataLoader
+from tqdm import tqdm
+
+def mean_std_simple(loader, device="cuda"):
+    n_px = 0
+    channel_sum = torch.zeros(3, device=device)
+    channel_sq  = torch.zeros(3, device=device)
+
+    for batch, _ in loader:
+        batch = batch.to(device, non_blocking=True)  # B,C,H,W in 0-1
+        b, c, h, w = batch.shape
+        n_px += b * h * w
+        channel_sum += batch.sum(dim=[0,2,3])
+        channel_sq  += (batch ** 2).sum(dim=[0,2,3])
+
+    mean = channel_sum / n_px
+    std  = (channel_sq / n_px - mean ** 2).sqrt()
+    return mean.cpu(), std.cpu()
+
+def compute_mean_std(
+    df_train: pd.DataFrame,
+    tf_no_norm: T.Compose,
+    batch_size: int = 64,
+    num_workers: int = 4,
+    max_samples: int | None = None,
+    device: torch.device | str = "cuda",
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    One-pass channel-wise mean / std. Uses Welford’s algorithm for numerical stability.
+    """
+    ds = ApaccDataset(df_train, tf_no_norm)      # or Smear2005BinaryDataset, …
+    if max_samples:
+        ds = torch.utils.data.Subset(ds, range(max_samples))
+    loader = DataLoader(ds, batch_size=batch_size, shuffle=False,
+                        num_workers=num_workers, pin_memory=True)
+
+    n_pixels = 0
+    mean = torch.zeros(3, device=device)
+    M2   = torch.zeros(3, device=device)   # sum of squared deviations
+
+    for batch, _ in tqdm(loader, desc="scanning"):
+        batch = batch.to(device, non_blocking=True)   # shape B×C×H×W, 0-1
+        pixels = batch.numel() // 3                   # B*H*W
+        n_pixels += pixels
+        batch = batch.view(3, -1)                     # C × (B*H*W)
+
+        # incremental mean / var
+        delta = batch.mean(1) - mean
+        mean += delta * (pixels / n_pixels)
+        M2   += (batch.var(1, unbiased=False) * pixels +
+                 (delta ** 2) * (n_pixels - pixels) * pixels / n_pixels)
+
+    var = M2 / n_pixels
+    std = torch.sqrt(var)
+
+    n_px = 0
+    channel_sum = torch.zeros(3, device=device)
+    channel_sq  = torch.zeros(3, device=device)
+
+    for batch, _ in loader:
+        batch = batch.to(device, non_blocking=True)  # B,C,H,W in 0-1
+        b, c, h, w = batch.shape
+        n_px += b * h * w
+        channel_sum += batch.sum(dim=[0,2,3])
+        channel_sq  += (batch ** 2).sum(dim=[0,2,3])
+
+    mean_simple = channel_sum / n_px
+    std_simple  = (channel_sq / n_px - mean ** 2).sqrt()
+    print('simple mean', mean_simple, 'simple std', std_simple)
+    
+    return mean.cpu(), std.cpu()
 
 # --------------------------------------------------------------------------
 #  2.  Transform visualisation helper
@@ -54,6 +135,7 @@ def show_transforms(df: pd.DataFrame, n: int = 4, seed: int = 0) -> None:
     titles = ["original", "train_tf", "val_tf"]
 
     for r, path in enumerate(sample_paths):
+        print(path)
         img_pil = Image.open(path).convert("RGB")
         imgs = [
             img_pil,
@@ -142,7 +224,7 @@ def filetype_breakdown(df: pd.DataFrame) -> None:
 # --------------------------------------------------------------------------
 def main() -> None:
     
-    ROOT = Path("../datasets/apacc_small")   # ←—— change me
+    ROOT = Path("./datasets/apacc")  
     NUM_FOLDS, SEED = 5, 42
 
     df = scan_apacc(ROOT, num_folds=NUM_FOLDS, seed=SEED)
@@ -153,12 +235,16 @@ def main() -> None:
     # 6-B  transform visualisation
     show_transforms(df.query("split == 'train'"), n=5, seed=SEED)
 
+    train_df = df.query("split == 'train'")
+    mean, std = compute_mean_std(train_df, train_tf_no_norm, batch_size=128)
+    print("channel-wise mean :", mean.tolist())
+    print("channel-wise std  :", std.tolist())
     # 6-C  image-size histogram
-    plot_size_distribution(df, max_images=None)  # set to e.g. 2000 for speed
+    #plot_size_distribution(df, max_images=None)  # set to e.g. 2000 for speed
 
     # 6-D  misc sanity checks
-    filetype_breakdown(df)
-    check_duplicates(df, max_bytes=2**18)   # 256 KB
+    #filetype_breakdown(df)
+    #check_duplicates(df, max_bytes=2**18)   # 256 KB
 
 
 if __name__ == "__main__":

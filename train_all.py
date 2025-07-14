@@ -7,10 +7,19 @@ import pandas as pd
 import numpy as np
 
 from sipakmed import (
-    download_sipakmed,
     scan_sipakmed,
     compute_class_weights,
     get_sipakmed_loaders,
+)
+
+from herlev import (
+    scan_herlev,
+    get_herlev_loaders
+)
+
+from apacc import (
+    scan_apacc,
+    get_apacc_loaders
 )
 
 from model_utils import load_any
@@ -66,7 +75,7 @@ TODO = {
     "MobileNet V4 small": "mobilenetv4_conv_small.e2400_r224_in1k",
     "ShuffleNet V2 1.0x": "tv_shufflenet_v2_x1_0",
     "GhostNet V3": "hf_hub:timm/ghostnetv3_100.in1k",
-    **{f"EfficientNet-B{i}":f"efficientnet_b{i}" for i in range(9)},}
+    **{f"EfficientNet-B{i}":f"efficientnet_b{i}" for i in range(4)},}
 
 # ----------------------------
 # Metrics for model evaluation
@@ -196,148 +205,157 @@ def _init_csv_logger(run_dir: Path):
 
 
 def main():
-    # ---------------- download / scan / weights ----------------
-    root = download_sipakmed(DATA_DIR)
-    df = scan_sipakmed(root, NUM_FOLDS, SEED)
+    # ---------------- roots / scanners / loaders ----------------
+    names = ["apacc","herlev","sipakmed"]
+    roots = [".\\datasets\\apacc", ".\\datasets\\herlev", ".\\datasets\\sipakmed"]
+    scanners = [scan_apacc, scan_herlev, scan_sipakmed]
+    get_loaders = [get_apacc_loaders, get_herlev_loaders, get_sipakmed_loaders]
 
-    criterion = nn.CrossEntropyLoss(weight=compute_class_weights(df, DEVICE))
+    for root, scanner, get_loader, name in zip(roots, scanners, get_loaders,names):
+        df = scanner(root, NUM_FOLDS, SEED)
 
-    print(f"Using device: {DEVICE}")
-    if torch.cuda.is_available():
-        print(" GPU:", torch.cuda.get_device_name())
+        criterion = nn.CrossEntropyLoss(weight=compute_class_weights(df, DEVICE))
 
-    run_dir = _setup_run_dir(METRICS_DIR)
-    log_file, _ = _init_csv_logger(run_dir)
-    history_rows = []
-    summary_rows = []
+        print(f"Using device: {DEVICE}")
+        if torch.cuda.is_available():
+            print(" GPU:", torch.cuda.get_device_name())
 
-    for friendly_name, backbone_id in TODO.items():
-        for fold in range(NUM_FOLDS):
-            print(f"\n> {friendly_name} | fold {fold}")
-            train_loader, val_loader = get_sipakmed_loaders(
-                df, fold, BATCH_SIZE, NUM_WORKERS, torch.cuda.is_available()
-            )
+        run_dir = _setup_run_dir(METRICS_DIR)
+        log_file, _ = _init_csv_logger(run_dir)
+        history_rows = []
+        summary_rows = []
 
-            model, _, origin = load_any(backbone_id, num_classes=2, pretrained=True)
-            model.to(DEVICE)
+        for friendly_name, backbone_id in TODO.items():
+            for fold in range(NUM_FOLDS):
+                print(f"\n> {name} | {friendly_name} | fold {fold}")
+                train_loader, val_loader = get_loader(
+                    df, fold, BATCH_SIZE, NUM_WORKERS, torch.cuda.is_available()
+                )
 
-            optimiser = torch.optim.SGD(
-                model.parameters(),
-                lr=LR,
-                momentum=MOMENTUM,
-                weight_decay=WEIGHT_DECAY,
-            )
-            scheduler = MultiStepLR(
-                optimiser, milestones=SCHEDULER_MILESTONES, gamma=SCHEDULER_GAMMA
-            )
+                model, _, origin = load_any(backbone_id, num_classes=2, pretrained=True)
+                model.to(DEVICE)
 
-            best_val = {
-                k: 0.0 for k in ["acc", "prec", "rec", "spec", "f1", "ppv", "npv"]
-            }
-            best_val["epoch"] = 0
+                optimiser = torch.optim.SGD(
+                    model.parameters(),
+                    lr=LR,
+                    momentum=MOMENTUM,
+                    weight_decay=WEIGHT_DECAY,
+                )
+                scheduler = MultiStepLR(
+                    optimiser, milestones=SCHEDULER_MILESTONES, gamma=SCHEDULER_GAMMA
+                )
 
-            for epoch in range(1, EPOCHS + 1):
-                t0 = time.time()
-                train_m = _run_epoch(train_loader, model, criterion, optimiser)
-                val_m = _run_epoch(val_loader, model, criterion)
-                scheduler.step()
-                duration = time.time() - t0
-                lr_now = scheduler.get_last_lr()[0]
+                best_val = {
+                    k: 0.0 for k in ["name","acc", "prec", "rec", "spec", "f1", "ppv", "npv"]
+                }
+                best_val["epoch"] = 0
 
-                for split_name, m in [("train", train_m), ("val", val_m)]:
-                    history_rows.append(
-                        OrderedDict(
-                            model=friendly_name,
-                            origin=origin,
-                            epoch=epoch,
-                            split=split_name,
-                            loss=m["loss"],
-                            acc=m["acc"],
-                            prec=m["prec"],
-                            rec=m["rec"],
-                            spec=m["spec"],
-                            f1=m["f1"],
-                            ppv=m["ppv"],
-                            npv=m["npv"],
-                            lr=lr_now,
-                            seconds=duration,
+                for epoch in range(1, EPOCHS + 1):
+                    t0 = time.time()
+                    train_m = _run_epoch(train_loader, model, criterion, optimiser)
+                    val_m = _run_epoch(val_loader, model, criterion)
+                    scheduler.step()
+                    duration = time.time() - t0
+                    lr_now = scheduler.get_last_lr()[0]
+
+                    for split_name, m in [("train", train_m), ("val", val_m)]:
+                        history_rows.append(
+                            OrderedDict(
+                                dataset=name
+                                model=friendly_name,
+                                origin=origin,
+                                epoch=epoch,
+                                split=split_name,
+                                loss=m["loss"],
+                                acc=m["acc"],
+                                prec=m["prec"],
+                                rec=m["rec"],
+                                spec=m["spec"],
+                                f1=m["f1"],
+                                ppv=m["ppv"],
+                                npv=m["npv"],
+                                lr=lr_now,
+                                seconds=duration,
+                            )
                         )
-                    )
 
-                if val_m["acc"] > best_val["acc"]:
-                    best_val.update(val_m)
-                    best_val["epoch"] = epoch
-                    torch.save(
-                        model.state_dict(),
-                        run_dir / "checkpoints" / f"{backbone_id}_best_{fold}.pt",
-                    )
+                    if val_m["acc"] > best_val["acc"]:
+                        best_val.update(val_m)
+                        best_val["epoch"] = epoch
+                        torch.save(
+                            model.state_dict(),
+                            run_dir / "checkpoints" / f"{name}_{backbone_id}_best_{fold}.pt",
+                        )
 
-                if epoch == 1 or epoch % 5 == 0 or epoch == EPOCHS:
-                    print(
-                        f"Ep{epoch:02d} loss {val_m['loss']:.4f} acc {val_m['acc']:.3f} f1 {val_m['f1']:.3f} (duration {duration:.1f}s)"
-                    )
+                    if epoch == 1 or epoch % 5 == 0 or epoch == EPOCHS:
+                        print(
+                            f"Ep{epoch:02d} loss {val_m['loss']:.4f} acc {val_m['acc']:.3f} f1 {val_m['f1']:.3f} (duration {duration:.1f}s)"
+                        )
 
-            summary_rows.append(
-                [
-                    friendly_name,
-                    best_val["epoch"],
-                    best_val["acc"],
-                    best_val["prec"],
-                    best_val["rec"],
-                    best_val["spec"],
-                    best_val["f1"],
-                    best_val["ppv"],
-                    best_val["npv"],
-                    fold,
-                ]
-            )
+                summary_rows.append(
+                    [
+                        name,
+                        friendly_name,
+                        best_val["epoch"],
+                        best_val["acc"],
+                        best_val["prec"],
+                        best_val["rec"],
+                        best_val["spec"],
+                        best_val["f1"],
+                        best_val["ppv"],
+                        best_val["npv"],
+                        fold,
+                    ]
+                )
 
-            # hygiene: free GPU memory between folds
-            del model, optimiser, scheduler, train_loader, val_loader
-            torch.cuda.empty_cache()
-            gc.collect()
+                # hygiene: free GPU memory between folds
+                del model, optimiser, scheduler, train_loader, val_loader
+                torch.cuda.empty_cache()
+                gc.collect()
 
-    # ----------------------------------
-    # Persist logs and summary to disk
-    # ----------------------------------
-    pd.DataFrame(history_rows).to_csv(
-        run_dir / "epoch_logs.csv",
-        index=False,
-        columns=[
-            "model",
-            "origin",
-            "epoch",
-            "split",
-            "loss",
-            "acc",
-            "prec",
-            "rec",
-            "spec",
-            "f1",
-            "ppv",
-            "npv",
-            "lr",
-            "seconds",
-        ],
-    )
+        # ----------------------------------
+        # Persist logs and summary to disk
+        # ----------------------------------
+        pd.DataFrame(history_rows).to_csv(
+            run_dir / "epoch_logs.csv",
+            index=False,
+            columns=[
+                "dataset",
+                "model",
+                "origin",
+                "epoch",
+                "split",
+                "loss",
+                "acc",
+                "prec",
+                "rec",
+                "spec",
+                "f1",
+                "ppv",
+                "npv",
+                "lr",
+                "seconds",
+            ],
+        )
 
-    pd.DataFrame(
-        summary_rows,
-        columns=[
-            "model",
-            "best_epoch",
-            "best_acc",
-            "best_prec",
-            "best_rec",
-            "best_spec",
-            "best_f1",
-            "best_ppv",
-            "best_npv",
-            "fold",
-        ],
-    ).to_csv(run_dir / "summary.csv", index=False)
+        pd.DataFrame(
+            summary_rows,
+            columns=[
+                "dataset",
+                "model",
+                "best_epoch",
+                "best_acc",
+                "best_prec",
+                "best_rec",
+                "best_spec",
+                "best_f1",
+                "best_ppv",
+                "best_npv",
+                "fold",
+            ],
+        ).to_csv(run_dir / "summary.csv", index=False)
 
-    log_file.close()
+        log_file.close()
 
 
 if __name__ == "__main__":

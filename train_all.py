@@ -1,5 +1,7 @@
 # misc
 from typing import Optional, Tuple, OrderedDict
+from pathlib import Path
+from tqdm import tqdm
 
 # Data management
 import os, random, csv, warnings, datetime, time
@@ -73,7 +75,7 @@ TODO = {
     "MobileNet V2 1.0x": "mobilenetv2_100",
     "MobileNet V4 small": "mobilenetv4_conv_small.e2400_r224_in1k",
     "ShuffleNet V2 1.0x": "tv_shufflenet_v2_x1_0",
-    "GhostNet V3": "hf_hub:timm/ghostnetv3_100.in1k",
+    "GhostNet V3": "ghostnetv3_100.in1k",
     **{f"EfficientNet-B{i}":f"efficientnet_b{i}" for i in range(4)},}
 
 # ----------------------------
@@ -92,10 +94,10 @@ def metrics_binary(y_true, y_pred) -> dict[str, float]:
 
     return {
         "acc": accuracy_score(y_true, y_pred),
-        "prec": precision_score(y_true, y_pred),  # PPV
-        "rec": recall_score(y_true, y_pred),  # Sensitivity
+        "prec": precision_score(y_true, y_pred, zero_division=0),  # PPV
+        "rec": recall_score(y_true, y_pred, zero_division=0),  # Sensitivity
         "spec": tn / (tn + fp + EPS),
-        "f1": f1_score(y_true, y_pred),
+        "f1": f1_score(y_true, y_pred, zero_division=0),
         "ppv": tp / (tp + fp + EPS),  # same as precision
         "npv": tn / (tn + fn + EPS),
     }
@@ -120,25 +122,27 @@ def _run_epoch(
     dataloader: DataLoader,
     model: nn.Module,
     criterion: nn.Module,
+    epoch_num: int,
+    split_name: str,
     optimiser: Optional[torch.optim.Optimizer] = None,
-) -> Tuple[float, float, float, float, float]:
+) -> dict[str, float]:
     """
-    Execute a single epoch.
+    Execute a single epoch with a tqdm progress bar.
     - If optimiser is provided -> training mode, gradients ON.
     - If optimiser is None     -> evaluation mode, gradients OFF.
-
-    Returns
-    -------
-    (avg_loss, accuracy, f1, recall, specificity)
     """
     training = optimiser is not None
     model.train(training)
 
     total_loss, preds, trues = 0.0, [], []
+    
+    # Create a description for the progress bar
+    desc = f"Epoch {epoch_num:02d} ({split_name.capitalize()})"
+    progress_bar = tqdm(dataloader, desc=desc, leave=True)
 
     ctx = torch.enable_grad() if training else torch.no_grad()
     with ctx:
-        for images, labels in dataloader:
+        for images, labels in progress_bar:
             images, labels = images.to(DEVICE), labels.to(DEVICE)
             model = model.to(DEVICE)
             logits = model(images)
@@ -163,7 +167,7 @@ def _run_epoch(
 
 
 # ----------------------------
-# Utility to create run folder & logger
+# Utility to create run folder
 # ----------------------------
 
 
@@ -171,32 +175,6 @@ def _setup_run_dir(metrics_dir: Path) -> Path:
     run_dir = metrics_dir / datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     (run_dir / "checkpoints").mkdir(parents=True, exist_ok=True)
     return run_dir
-
-
-def _init_csv_logger(run_dir: Path):
-    path = run_dir / "epoch_logs.csv"
-    f = path.open("w", newline="")
-    w = csv.writer(f)
-    w.writerow(
-        [
-            "dataset"
-            "model",
-            "origin",
-            "epoch",
-            "split",
-            "loss",
-            "acc",
-            "prec",
-            "rec",
-            "spec",
-            "f1",
-            "ppv",
-            "npv",
-            "lr",
-            "seconds",
-        ]
-    )
-    return f, w
 
 
 # ----------------------------
@@ -207,12 +185,31 @@ def _init_csv_logger(run_dir: Path):
 def main():
     # ---------------- roots / scanners / loaders ----------------
     names = ["apacc","herlev","sipakmed"]
-    roots = [".\\datasets\\apacc", ".\\datasets\\herlev", ".\\datasets\\sipakmed"]
+    roots = [Path(".\\datasets\\apacc"), Path(".\\datasets\\herlev"), Path(".\\datasets\\sipakmed")]
     scanners = [scan_apacc, scan_herlev, scan_sipakmed]
     get_loaders = [get_apacc_loaders, get_herlev_loaders, get_sipakmed_loaders]
 
     for root, scanner, get_loader, name in zip(roots, scanners, get_loaders,names):
-        df = scanner(root, NUM_FOLDS, SEED)
+
+        if name == "apacc":
+            TODO = {
+                #"SqueezeNet 1.1": "tv_squeezenet1_1",
+                #"MobileNet V2 1.0x": "mobilenetv2_100",
+                #"MobileNet V4 small": "mobilenetv4_conv_small.e2400_r224_in1k",
+                #"ShuffleNet V2 1.0x": "tv_shufflenet_v2_x1_0",
+                #"GhostNet V3": "ghostnetv3_100.in1k",
+                **{f"EfficientNet-B{i}":f"efficientnet_b{i}" for i in range(4)},
+                }
+        else:
+            TODO = {
+                "SqueezeNet 1.1": "tv_squeezenet1_1",
+                "MobileNet V2 1.0x": "mobilenetv2_100",
+                "MobileNet V4 small": "mobilenetv4_conv_small.e2400_r224_in1k",
+                "ShuffleNet V2 1.0x": "tv_shufflenet_v2_x1_0",
+                #"GhostNet V3": "ghostnetv3_100.in1k",
+                **{f"EfficientNet-B{i}":f"efficientnet_b{i}" for i in range(4)},}
+
+        df = scanner(root=root, num_folds=NUM_FOLDS, seed=SEED)
 
         criterion = nn.CrossEntropyLoss(weight=compute_class_weights(df, DEVICE))
 
@@ -221,15 +218,25 @@ def main():
             print(" GPU:", torch.cuda.get_device_name())
 
         run_dir = _setup_run_dir(METRICS_DIR)
-        log_file, _ = _init_csv_logger(run_dir)
-        history_rows = []
-        summary_rows = []
 
+        # --- Initialize CSV files with headers ---
+        epoch_cols = [
+            "dataset", "model", "origin", "epoch", "split", "loss", "acc",
+            "prec", "rec", "spec", "f1", "ppv", "npv", "lr", "seconds"
+        ]
+        pd.DataFrame(columns=epoch_cols).to_csv(run_dir / "epoch_logs.csv", index=False)
+
+        summary_cols = [
+            "dataset", "model", "best_epoch", "best_acc", "best_prec", "best_rec",
+            "best_spec", "best_f1", "best_ppv", "best_npv", "fold"
+        ]
+        pd.DataFrame(columns=summary_cols).to_csv(run_dir / "summary.csv", index=False)
+        
         for friendly_name, backbone_id in TODO.items():
             for fold in range(NUM_FOLDS):
                 print(f"\n> {name} | {friendly_name} | fold {fold}")
                 train_loader, val_loader = get_loader(
-                    df, fold, BATCH_SIZE, NUM_WORKERS, torch.cuda.is_available()
+                    df=df, fold=fold, batch_size=BATCH_SIZE, num_workers=NUM_WORKERS, pin_memory=torch.cuda.is_available()
                 )
 
                 model, _, origin = load_any(backbone_id, num_classes=2, pretrained=True)
@@ -252,31 +259,39 @@ def main():
 
                 for epoch in range(1, EPOCHS + 1):
                     t0 = time.time()
-                    train_m = _run_epoch(train_loader, model, criterion, optimiser)
-                    val_m = _run_epoch(val_loader, model, criterion)
+                    
+                    # --- Run epochs with progress bar ---
+                    train_m = _run_epoch(train_loader, model, criterion, epoch, "train", optimiser)
+                    val_m = _run_epoch(val_loader, model, criterion, epoch, "val")
+                    
                     scheduler.step()
                     duration = time.time() - t0
                     lr_now = scheduler.get_last_lr()[0]
 
                     for split_name, m in [("train", train_m), ("val", val_m)]:
-                        history_rows.append(
-                            OrderedDict(
-                                dataset=name
-                                model=friendly_name,
-                                origin=origin,
-                                epoch=epoch,
-                                split=split_name,
-                                loss=m["loss"],
-                                acc=m["acc"],
-                                prec=m["prec"],
-                                rec=m["rec"],
-                                spec=m["spec"],
-                                f1=m["f1"],
-                                ppv=m["ppv"],
-                                npv=m["npv"],
-                                lr=lr_now,
-                                seconds=duration,
-                            )
+                        # --- Append epoch data directly to CSV ---
+                        row_data = OrderedDict(
+                            dataset=name,
+                            model=friendly_name,
+                            origin=origin,
+                            epoch=epoch,
+                            split=split_name,
+                            loss=m["loss"],
+                            acc=m["acc"],
+                            prec=m["prec"],
+                            rec=m["rec"],
+                            spec=m["spec"],
+                            f1=m["f1"],
+                            ppv=m["ppv"],
+                            npv=m["npv"],
+                            lr=lr_now,
+                            seconds=duration,
+                        )
+                        pd.DataFrame([row_data]).to_csv(
+                            run_dir / "epoch_logs.csv",
+                            mode='a',
+                            header=False,
+                            index=False
                         )
 
                     if val_m["acc"] > best_val["acc"]:
@@ -292,71 +307,31 @@ def main():
                             f"Ep{epoch:02d} loss {val_m['loss']:.4f} acc {val_m['acc']:.3f} f1 {val_m['f1']:.3f} (duration {duration:.1f}s)"
                         )
 
-                summary_rows.append(
-                    [
-                        name,
-                        friendly_name,
-                        best_val["epoch"],
-                        best_val["acc"],
-                        best_val["prec"],
-                        best_val["rec"],
-                        best_val["spec"],
-                        best_val["f1"],
-                        best_val["ppv"],
-                        best_val["npv"],
-                        fold,
-                    ]
+                # --- Append fold summary data directly to CSV ---
+                summary_row = [
+                    name,
+                    friendly_name,
+                    best_val["epoch"],
+                    best_val["acc"],
+                    best_val["prec"],
+                    best_val["rec"],
+                    best_val["spec"],
+                    best_val["f1"],
+                    best_val["ppv"],
+                    best_val["npv"],
+                    fold,
+                ]
+                pd.DataFrame([summary_row], columns=summary_cols).to_csv(
+                    run_dir / "summary.csv",
+                    mode='a',
+                    header=False,
+                    index=False
                 )
-
+                
                 # hygiene: free GPU memory between folds
                 del model, optimiser, scheduler, train_loader, val_loader
                 torch.cuda.empty_cache()
                 gc.collect()
-
-        # ----------------------------------
-        # Persist logs and summary to disk
-        # ----------------------------------
-        pd.DataFrame(history_rows).to_csv(
-            run_dir / "epoch_logs.csv",
-            index=False,
-            columns=[
-                "dataset",
-                "model",
-                "origin",
-                "epoch",
-                "split",
-                "loss",
-                "acc",
-                "prec",
-                "rec",
-                "spec",
-                "f1",
-                "ppv",
-                "npv",
-                "lr",
-                "seconds",
-            ],
-        )
-
-        pd.DataFrame(
-            summary_rows,
-            columns=[
-                "dataset",
-                "model",
-                "best_epoch",
-                "best_acc",
-                "best_prec",
-                "best_rec",
-                "best_spec",
-                "best_f1",
-                "best_ppv",
-                "best_npv",
-                "fold",
-            ],
-        ).to_csv(run_dir / "summary.csv", index=False)
-
-        log_file.close()
-
 
 if __name__ == "__main__":
     main()

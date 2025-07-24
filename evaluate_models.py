@@ -1,187 +1,238 @@
-# misc
+# cross_dataset_evaluate.py
+# ==============================================================
+# Evaluate every *.pt checkpoint under MODELS_DIR on all datasets
+# ==============================================================
+
+# -------- Standard libs ----------
 import os
 import gc
+from pathlib import Path
+from typing import Tuple, Dict, List
+
+# -------- Third-party ----------
 import pandas as pd
 import torch
-from pathlib import Path
-from tqdm import tqdm
-from typing import Optional, Tuple
-
-# --- User's custom modules (ensure they are in the same directory or python path) ---
-from model_utils import load_any
-from sipakmed import scan_sipakmed, get_sipakmed_loaders
-from herlev import scan_herlev, get_herlev_loaders
-from apacc import scan_apacc, get_apacc_loaders
-
-# Metrics and model imports from the previous script
 from torch import nn
 from torch.utils.data import DataLoader
 from sklearn.metrics import (
-    accuracy_score,
-    recall_score,
-    f1_score,
-    precision_score,
-    confusion_matrix,
+    accuracy_score, recall_score, f1_score,
+    precision_score, confusion_matrix,
+)
+from tqdm import tqdm
+
+# -------- Project-specific ----------
+from model_utils import load_any                               # backbone loader
+
+# SiPaKMeD
+from sipakmed import (
+    scan_sipakmed, SipakmedDataset, val_tf as sipak_val_tf,
+)
+# Herlev
+from herlev import (
+    scan_herlev, HerlevDataset, val_tf as herlev_val_tf,
+)
+# APaCC
+from apacc import (
+    scan_apacc, ApaccDataset, val_tf as apacc_val_tf,
 )
 
-# =================================================================================
-# SCRIPT CONFIGURATION
-# =================================================================================
+# ==============================================================
+# CONFIGURATION
+# ==============================================================
+MODELS_DIR     = Path(
+    "C:\\Users\\Workstation-Lab\\Documents\\Arquivos do Artur Pedro\\labcity\\cervical_cancer_cnn\\workspace\\metrics"
+)                               # folder that holds sub-folders with checkpoints
+DEVICE          = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+BATCH_SIZE      = 32
+NUM_WORKERS     = int(os.getenv("NUM_WORKERS", 2))
+SEED            = 42
+EPS             = 1e-9
 
-# --- 1. SET THE PATH TO YOUR TRAINED MODELS ---
-# This should be the 'checkpoints' directory created by the training script.
-MODELS_DIR = Path("C:\\Users\\Workstation-Lab\\Documents\\Arquivos do Artur Pedro\\labcity\\cervical_cancer_cnn\\evaluate")
-
-# --- 2. OTHER CONFIG ---
-DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-BATCH_SIZE = 32
-NUM_WORKERS = int(os.getenv("NUM_WORKERS", 2))
-SEED = 42
-EPS = 1e-9
-
-# =================================================================================
-# HELPER FUNCTIONS
-# =================================================================================
-
+# ==============================================================
+# METRIC HELPERS
+# ==============================================================
 def _confusion_parts(y_true, y_pred) -> Tuple[int, int, int, int]:
     tn, fp, fn, tp = confusion_matrix(y_true, y_pred, labels=[0, 1]).ravel()
     return tn, fp, fn, tp
 
 
-def metrics_binary(y_true, y_pred) -> dict[str, float]:
-    """Return all requested binary-classification metrics in one dict."""
+def metrics_binary(y_true, y_pred) -> Dict[str, float]:
     tn, fp, fn, tp = _confusion_parts(y_true, y_pred)
     return {
-        "acc": accuracy_score(y_true, y_pred),
+        "acc":  accuracy_score(y_true, y_pred),
         "prec": precision_score(y_true, y_pred, zero_division=0),
-        "rec": recall_score(y_true, y_pred, zero_division=0),
+        "rec":  recall_score(y_true, y_pred,  zero_division=0),
         "spec": tn / (tn + fp + EPS),
-        "f1": f1_score(y_true, y_pred, zero_division=0),
-        "ppv": tp / (tp + fp + EPS),
-        "npv": tn / (tn + fn + EPS),
+        "f1":   f1_score(y_true, y_pred,     zero_division=0),
+        "ppv":  tp / (tp + fp + EPS),
+        "npv":  tn / (tn + fn + EPS),
     }
 
 
-def evaluate_model(dataloader: DataLoader, model: nn.Module) -> dict[str, float]:
-    """Runs a single evaluation pass and returns metrics."""
-    model.eval()
-    model.to(DEVICE)
+def evaluate_model(loader: DataLoader, model: nn.Module) -> Dict[str, float]:
+    model.eval(); model.to(DEVICE)
     preds, trues = [], []
-
     with torch.no_grad():
-        for images, labels in dataloader:
-            images, labels = images.to(DEVICE), labels.to(DEVICE)
-            logits = model(images)
-            preds.append(logits.detach().argmax(1).cpu())
+        for imgs, labels in loader:
+            imgs, labels = imgs.to(DEVICE), labels.to(DEVICE)
+            logits = model(imgs)
+            preds.append(logits.argmax(1).cpu())
             trues.append(labels.cpu())
+    return metrics_binary(torch.cat(trues), torch.cat(preds))
 
-    y_pred = torch.cat(preds)
-    y_true = torch.cat(trues)
-    return metrics_binary(y_true, y_pred)
+# ==============================================================
+# DATASET MAP with per-dataset normalisation
+# ==============================================================
+dataset_map = {
+    "sipakmed": {
+        "root":     Path("./datasets/sipakmed"),
+        "scanner":  scan_sipakmed,
+        "dataset":  SipakmedDataset,
+        "val_tf":   sipak_val_tf,
+    },
+    "herlev": {
+        "root":     Path("./datasets/herlev"),
+        "scanner":  scan_herlev,
+        "dataset":  HerlevDataset,
+        "val_tf":   herlev_val_tf,
+    },
+    "apacc": {
+        "root":     Path("./datasets/apacc"),
+        "scanner":  scan_apacc,
+        "dataset":  ApaccDataset,
+        "val_tf":   apacc_val_tf,
+    },
+}
 
+# --------------------------------------------------------------
+# Build a loader with an arbitrary normalisation
+# --------------------------------------------------------------
+def build_loader(
+    df: pd.DataFrame,
+    dataset_cls,
+    transform,
+    batch_size=BATCH_SIZE,
+    num_workers=NUM_WORKERS,
+    pin=True,
+) -> DataLoader:
+    ds = dataset_cls(df.reset_index(drop=True), transform)
+    return DataLoader(
+        ds,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=pin,
+    )
 
-# =================================================================================
-# MAIN VALIDATION LOGIC
-# =================================================================================
-
+# ==============================================================
+# MAIN
+# ==============================================================
 def main():
-    """
-    Main function to validate models from one dataset on all other datasets.
-    """
     if not MODELS_DIR.exists():
-        print(f"Error: Models directory not found at '{MODELS_DIR}'")
+        print(f"❌ MODELS_DIR not found: {MODELS_DIR}")
         return
 
-    # --- Mapping to select the correct data loader ---
-    dataset_map = {
-        "sipakmed": {"scanner": scan_sipakmed, "loader": get_sipakmed_loaders, "path": Path(".\\datasets\\sipakmed")},
-        "herlev": {"scanner": scan_herlev, "loader": get_herlev_loaders, "path": Path(".\\datasets\\herlev")},
-        "apacc": {"scanner": scan_apacc, "loader": get_apacc_loaders, "path": Path(".\\datasets\\apacc")},
-    }
-
-    # --- Find all model files ---
-    model_files = list(MODELS_DIR.glob("*.pt"))
+    model_files: List[Path] = list(MODELS_DIR.rglob("*.pt"))
     if not model_files:
-        print(f"Error: No '.pt' model files found in '{MODELS_DIR}'.")
+        print(f"❌ No .pt files found under {MODELS_DIR}")
         return
 
-    print(f"Found {len(model_files)} models to evaluate across all datasets.")
+    print(f"Found {len(model_files)} checkpoints.")
     print(f"Using device: {DEVICE}")
+
+    results: List[dict] = []
     
-    results = []
+    if os.path.exists(MODELS_DIR / "all_cross_results" / "cross_dataset_validation_results.csv"):
+        curr_csv = pd.read_csv(MODELS_DIR / "all_cross_results" / "cross_dataset_validation_results.csv")
+        evaluated_paths = [path.split("\\")[-1] for path in curr_csv["checkpoint"].tolist()]
+        print(evaluated_paths)
 
-    # --- Loop through each dataset as a validation target ---
-    for target_name, target_info in dataset_map.items():
-        print(f"\n--- Preparing to validate on dataset: {target_name.upper()} ---")
+    models = []
+    for model in model_files:
+        if os.path.exists(MODELS_DIR / "all_cross_results" / "cross_dataset_validation_results.csv"):  
+            if str(model).split("\\")[-1] in evaluated_paths:
+                print(f"✅  Already evaluated: {model.relative_to(MODELS_DIR)}")
+                continue
+            else:
+                models.append(model)
+    model_files = models
+    # ----------------------------------------------------------
+    # iterate over each target dataset
+    # ----------------------------------------------------------
+    for target_name, tgt in dataset_map.items():
+        print(f"\n=== Evaluating on {target_name.upper()} dataset ===")
 
-        # Prepare the target dataset's test loader (using validation set of fold 0)
-        df_target = target_info["scanner"](root=target_info["path"], num_folds=5, seed=SEED)
-        _, test_loader = target_info["loader"](
-            df=df_target,
-            fold=0,
-            batch_size=BATCH_SIZE,
-            num_workers=NUM_WORKERS,
-            pin_memory=torch.cuda.is_available()
-        )
-
-        # --- Loop through models and evaluate on the current target dataset ---
-        progress_desc = f"Validating on {target_name}"
-        for model_path in tqdm(model_files, desc=progress_desc):
+        # Build dataframe once (all folds); we will slice fold-0 below
+        df_target = tgt["scanner"](root=tgt["root"], num_folds=5, seed=SEED)
+        
+        # loop over every checkpoint
+        for ckpt_path in tqdm(model_files, desc=f"Validating on {target_name}"):
             try:
-                # Parse filename: e.g., "sipakmed_efficientnet_b0_best_0.pt"
-                parts = model_path.stem.split('_')
-                training_dataset = parts[0]
                 
-                # *** Skip if the model was trained on the current target dataset ***
-                if training_dataset == target_name:
-                    continue
+                print(ckpt_path)
+                # Expect names like  sipakmed_efficientnet_b0_best_0.pt
+                parts             = ckpt_path.stem.split("_")
+                training_dataset  = parts[0]
+        
+                training_fold     = int(parts[-1])
+                backbone_id       = "_".join(parts[1:-2])   # between dataset tag and 'best'
 
-                training_fold = int(parts[-1])
-                backbone_id = "_".join(parts[0:-2])
+                # normalisation to apply = training dataset's val_tf
+                eval_tf           = dataset_map[training_dataset]["val_tf"]
 
-                # Load model architecture and weights
+                # build loader on *target* images but with *eval_tf*
+                test_df           = df_target[df_target.fold == 0]     # fold-0 split
+                test_loader       = build_loader(
+                    test_df,
+                    tgt["dataset"],
+                    eval_tf,
+                )
+
+                # load model + weights
                 model, _, _ = load_any(backbone_id, num_classes=2)
-                model.load_state_dict(torch.load(model_path, map_location=DEVICE))
+                model.load_state_dict(torch.load(ckpt_path, map_location=DEVICE), strict=True)
 
-                # Evaluate
+                # evaluate
                 metrics = evaluate_model(test_loader, model)
 
-                # Store results
                 results.append({
+                    "checkpoint":    str(ckpt_path.relative_to(MODELS_DIR)),
                     "model_backbone": backbone_id,
-                    "trained_on": training_dataset,
-                    "training_fold": training_fold,
-                    "validated_on": target_name,
-                    "accuracy": metrics["acc"],
-                    "f1_score": metrics["f1"],
-                    "precision": metrics["prec"],
-                    "recall": metrics["rec"],
-                    "specificity": metrics["spec"],
+                    "trained_on":     training_dataset,
+                    "training_fold":  training_fold,
+                    "validated_on":   target_name,
+                    "accuracy":       metrics["acc"],
+                    "f1_score":       metrics["f1"],
+                    "precision":      metrics["prec"],
+                    "recall":         metrics["rec"],
+                    "specificity":    metrics["spec"],
                 })
 
-                # Clean up memory
+                # tidy GPU / RAM
                 del model
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
                 gc.collect()
 
             except Exception as e:
-                print(f"\nWarning: Could not process file '{model_path.name}': {e}")
+                print(f"⚠️  Skipping '{ckpt_path}': {e}")
 
-    # --- Display and save final results ---
+    # ----------------------------------------------------------
+    # Save combined results
+    # ----------------------------------------------------------
     if not results:
-        print("\nNo cross-dataset validations could be performed.")
+        print("\nNo cross-dataset evaluations completed.")
         return
-        
-    results_df = pd.DataFrame(results)
-    
-    print("\n\n--- Cross-Dataset Validation Results ---")
-    print(results_df.round(4).to_string())
 
-    # Save to CSV in the parent directory of the checkpoints folder
-    output_path = MODELS_DIR.parent / "cross_dataset_validation_results.csv"
-    results_df.to_csv(output_path, index=False)
-    print(f"\nResults saved to '{output_path}'")
+    results_df = pd.DataFrame(results)
+    print("\n=== Cross-Dataset Validation Results ===")
+    print(results_df.round(4).to_string(index=False))
+
+    output_dir = MODELS_DIR / "all_cross_results"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    out_csv = output_dir / "cross_dataset_validation_results_extra.csv"
+    results_df.to_csv(out_csv, index=False)
+    print(f"\n✅  Results saved to: {out_csv.resolve()}")
 
 
 if __name__ == "__main__":

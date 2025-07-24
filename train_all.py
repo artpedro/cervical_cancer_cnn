@@ -191,24 +191,6 @@ def main():
 
     for root, scanner, get_loader, name in zip(roots, scanners, get_loaders,names):
 
-        if name == "apacc":
-            TODO = {
-                #"SqueezeNet 1.1": "tv_squeezenet1_1",
-                #"MobileNet V2 1.0x": "mobilenetv2_100",
-                #"MobileNet V4 small": "mobilenetv4_conv_small.e2400_r224_in1k",
-                #"ShuffleNet V2 1.0x": "tv_shufflenet_v2_x1_0",
-                #"GhostNet V3": "ghostnetv3_100.in1k",
-                **{f"EfficientNet-B{i}":f"efficientnet_b{i}" for i in range(4)},
-                }
-        else:
-            TODO = {
-                "SqueezeNet 1.1": "tv_squeezenet1_1",
-                "MobileNet V2 1.0x": "mobilenetv2_100",
-                "MobileNet V4 small": "mobilenetv4_conv_small.e2400_r224_in1k",
-                "ShuffleNet V2 1.0x": "tv_shufflenet_v2_x1_0",
-                #"GhostNet V3": "ghostnetv3_100.in1k",
-                **{f"EfficientNet-B{i}":f"efficientnet_b{i}" for i in range(4)},}
-
         df = scanner(root=root, num_folds=NUM_FOLDS, seed=SEED)
 
         criterion = nn.CrossEntropyLoss(weight=compute_class_weights(df, DEVICE))

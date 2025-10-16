@@ -618,15 +618,8 @@ If using this framework, please cite:
   url = {https://github.com/[repository]},
 }
 ```
-
----
-
-## License
-
-[Specify License]
-
 ---
 
 ## Contact
 
-For questions or collaboration inquiries, contact: [Contact Information]
+For questions or collaboration inquiries, contact: arturpedromartins@gmail.com

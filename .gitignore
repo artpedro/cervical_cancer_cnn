@@ -1,4 +1,4 @@
 workspace
 venv
 __pycache__
-datasets
+datasets/data

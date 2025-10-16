@@ -21,12 +21,11 @@ from tqdm import tqdm
 # ─────────── configuration ────────────
 SEED = 42
 DATASETS = {
-    "apacc": {"root": r".\datasets\apacc", "module": "apacc",    "num_folds": 5},
-    "herlev"  : {"root": r".\datasets\herlev",   "module": "herlev","num_folds": 5},
-    "sipakmed"   : {"root": r".\datasets\sipakmed",    "module": "sipakmed", "num_folds": 5},
-    # add more …
+    "apacc": {"root": r"apacc", "module": "apacc",    "num_folds": 5},
+    "herlev"  : {"root": r"herlev",   "module": "herlev","num_folds": 5},
+    "sipakmed"   : {"root": r"sipakmed",    "module": "sipakmed", "num_folds": 5},
 }
-OUT_YAML = Path("dataset_stats.yaml")
+OUT_YAML = Path(".\dataset_stats.yaml")
 NUM_WORKERS = 4            # set 0 to avoid multiprocessing entirely
 # ──────────────────────────────────────
 

@@ -11,7 +11,7 @@ import torch
 import torchvision.transforms as T
 from tqdm import tqdm
 
-from apacc import (
+from cervical_cancer_cnn.datasets.apacc import (
     scan_apacc,
     ApaccDataset,
     train_tf,

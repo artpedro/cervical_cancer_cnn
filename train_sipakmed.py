@@ -6,7 +6,7 @@ import os, random, csv, warnings, datetime, time
 import pandas as pd
 import numpy as np
 
-from sipakmed import (
+from datasets.sipakmed import (
     download_sipakmed,
     scan_sipakmed,
     compute_class_weights,

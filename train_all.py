@@ -13,12 +13,12 @@ from sipakmed import (
     get_sipakmed_loaders,
 )
 
-from herlev import (
+from cervical_cancer_cnn.datasets.herlev import (
     scan_herlev,
     get_herlev_loaders
 )
 
-from apacc import (
+from cervical_cancer_cnn.datasets.apacc import (
     scan_apacc,
     get_apacc_loaders
 )
@@ -190,6 +190,24 @@ def main():
     get_loaders = [get_apacc_loaders, get_herlev_loaders, get_sipakmed_loaders]
 
     for root, scanner, get_loader, name in zip(roots, scanners, get_loaders,names):
+
+        if name == "apacc":
+            TODO = {
+                #"SqueezeNet 1.1": "tv_squeezenet1_1",
+                #"MobileNet V2 1.0x": "mobilenetv2_100",
+                #"MobileNet V4 small": "mobilenetv4_conv_small.e2400_r224_in1k",
+                #"ShuffleNet V2 1.0x": "tv_shufflenet_v2_x1_0",
+                #"GhostNet V3": "ghostnetv3_100.in1k",
+                **{f"EfficientNet-B{i}":f"efficientnet_b{i}" for i in range(4)},
+                }
+        else:
+            TODO = {
+                "SqueezeNet 1.1": "tv_squeezenet1_1",
+                "MobileNet V2 1.0x": "mobilenetv2_100",
+                "MobileNet V4 small": "mobilenetv4_conv_small.e2400_r224_in1k",
+                "ShuffleNet V2 1.0x": "tv_shufflenet_v2_x1_0",
+                #"GhostNet V3": "ghostnetv3_100.in1k",
+                **{f"EfficientNet-B{i}":f"efficientnet_b{i}" for i in range(4)},}
 
         df = scanner(root=root, num_folds=NUM_FOLDS, seed=SEED)
 

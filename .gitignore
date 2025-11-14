@@ -2,3 +2,4 @@ workspace
 venv
 __pycache__
 datasets/data
+.venv

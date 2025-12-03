@@ -8,21 +8,11 @@ import os, random, csv, warnings, datetime, time
 import pandas as pd
 import numpy as np
 
-from sipakmed import (
-    scan_sipakmed,
-    get_sipakmed_loaders,
-)
-
-from cervical_cancer_cnn.datasets.herlev import (
-    scan_herlev,
-    get_herlev_loaders
-)
-
-from cervical_cancer_cnn.datasets.apacc import (
-    scan_apacc,
-    get_apacc_loaders
-)
-
+# Import weighted sampler versions
+from datasets.datasets import {
+    scan_sipakmed, scan_herlev, scan_apacc,
+    get_loaders,
+}
 
 # Models
 import torch, torch.nn as nn
@@ -185,12 +175,10 @@ def _setup_run_dir(metrics_dir: Path) -> Path:
 def main():
     # ---------------- roots / scanners / loaders ----------------
     names = ["apacc","herlev","sipakmed"]
-    roots = [Path(".\\datasets\\apacc"), Path(".\\datasets\\herlev"), Path(".\\datasets\\sipakmed")]
+    roots = [Path("./datasets/data/apacc"), Path("./datasets/data/smear2005"), Path("./datasets/data/sipakmed")]
     scanners = [scan_apacc, scan_herlev, scan_sipakmed]
-    get_loaders = [get_apacc_loaders, get_herlev_loaders, get_sipakmed_loaders]
-
-    for root, scanner, get_loader, name in zip(roots, scanners, get_loaders,names):
-
+    
+    for root, scanner, name in zip(roots, scanners, names):
         if name == "apacc":
             TODO = {
                 #"SqueezeNet 1.1": "tv_squeezenet1_1",
@@ -210,8 +198,6 @@ def main():
                 **{f"EfficientNet-B{i}":f"efficientnet_b{i}" for i in range(4)},}
 
         df = scanner(root=root, num_folds=NUM_FOLDS, seed=SEED)
-
-        criterion = nn.CrossEntropyLoss(weight=compute_class_weights(df, DEVICE))
 
         print(f"Using device: {DEVICE}")
         if torch.cuda.is_available():
@@ -235,9 +221,11 @@ def main():
         for friendly_name, backbone_id in TODO.items():
             for fold in range(NUM_FOLDS):
                 print(f"\n> {name} | {friendly_name} | fold {fold}")
-                train_loader, val_loader = get_loader(
+                train_loader, val_loader = get_loaders(
                     df=df, fold=fold, batch_size=BATCH_SIZE, num_workers=NUM_WORKERS, pin_memory=torch.cuda.is_available()
                 )
+                
+                criterion = nn.CrossEntropyLoss(weight=compute_class_weights(df.loc[df["fold"] == fold and df["split"] == "train_dev"], DEVICE))
 
                 model, _, origin = load_any(backbone_id, num_classes=2, pretrained=True)
                 model.to(DEVICE)

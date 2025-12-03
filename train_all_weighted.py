@@ -9,21 +9,10 @@ import pandas as pd
 import numpy as np
 
 # Import weighted sampler versions
-from datasets.sipakmed_weighted_sampler import (
-    scan_sipakmed,
-    get_sipakmed_loaders_weighted,
-    download_sipakmed,
-)
-
-from datasets.herlev_weighted_sampler import (
-    scan_herlev,
-    get_herlev_loaders_weighted
-)
-
-from datasets.apacc_weighted_sampler import (
-    scan_apacc,
-    get_apacc_loaders_weighted
-)
+from datasets.datasets import {
+    scan_sipakmed, scan_herlev, scan_apacc,
+    get_loaders_weighted,
+}
 
 # Models
 import torch, torch.nn as nn
@@ -39,6 +28,7 @@ from sklearn.metrics import (
     precision_score,
     confusion_matrix,
 )
+
 import gc
 
 # ----------------------------
@@ -54,9 +44,8 @@ torch.backends.cudnn.benchmark = False
 
 DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
-DATA_DIR = Path(os.getenv("DATA_DIR", ".\\workspace\\data"))
-METRICS_DIR = Path(os.getenv("METRICS_DIR", ".\\workspace\\metrics"))
-RUNS_DIR = Path(os.getenv("RUNS_DIR", ".\\workspace\\runs"))
+METRICS_DIR = Path(".\\workspace\\metrics_wl")
+RUNS_DIR = Path(".\\workspace\\runs_wl")
 
 BATCH_SIZE = 32
 NUM_WORKERS = int(os.getenv("NUM_WORKERS", 2))
@@ -184,32 +173,20 @@ def main():
     # ---------------- roots / scanners / loaders ----------------
     names = ["sipakmed", "herlev", "apacc"]
     roots = [
-        DATA_DIR / "sipakmed",
-        Path(".\\datasets\\herlev"),
-        Path(".\\datasets\\apacc")
+        Path("./datasets/data/sipakmed"),
+        Path("./datasets/data/smear2005"),
+        Path("./datasets/data/apacc")
     ]
     scanners = [scan_sipakmed, scan_herlev, scan_apacc]
-    get_loaders = [
-        get_sipakmed_loaders_weighted,
-        get_herlev_loaders_weighted,
-        get_apacc_loaders_weighted
-    ]
 
-    for root, scanner, get_loader, name in zip(roots, scanners, get_loaders, names):
+    for root, scanner, name in zip(roots, scanners, names):
         print(f"\n{'='*70}")
         print(f"DATASET: {name.upper()}")
         print(f"{'='*70}")
 
-        # Download SIPaKMeD if needed
-        if name == "sipakmed":
-            root = download_sipakmed(DATA_DIR)
-
         # Scan dataset
-        if name == "apacc":
-            df = scanner(root=root, num_folds=NUM_FOLDS, seed=SEED)
-        else:
-            df = scanner(root, num_folds=NUM_FOLDS, seed=SEED)
-
+        df = scanner(root=root, num_folds=NUM_FOLDS, seed=SEED)
+        
         # Show class distribution
         class_dist = df["binary_idx"].value_counts().sort_index()
         total = len(df)
@@ -242,21 +219,13 @@ def main():
             "best_spec", "best_f1", "best_ppv", "best_npv", "fold"
         ]
         pd.DataFrame(columns=summary_cols).to_csv(run_dir / "summary.csv", index=False)
-
-        # Adjust model list for APACC (as in original)
-        if name == "apacc":
-            TODO_LOCAL = {
-                **{f"EfficientNet-B{i}":f"efficientnet_b{i}" for i in range(4)},
-            }
-        else:
-            TODO_LOCAL = TODO
         
-        for friendly_name, backbone_id in TODO_LOCAL.items():
+        for friendly_name, backbone_id in TODO.items():
             for fold in range(NUM_FOLDS):
                 print(f"\n> {name} | {friendly_name} | fold {fold}")
                 
                 # Use weighted sampler loaders
-                train_loader, val_loader = get_loader(
+                train_loader, val_loader = get_loaders_weighted(
                     df=df, fold=fold, batch_size=BATCH_SIZE, 
                     num_workers=NUM_WORKERS, pin_memory=torch.cuda.is_available()
                 )

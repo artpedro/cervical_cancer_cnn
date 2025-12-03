@@ -42,8 +42,7 @@ IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD = [0.229, 0.224, 0.225]
 
 # Path to JSON file where per-dataset normalization stats are stored
-NORM_STATS_PATH = Path("normalization_stats.json")
-
+NORM_STATS_PATH = Path("./datasets/normalization_stats.json")
 
 # ============================================================
 # TRANSFORM BUILDERS
@@ -577,6 +576,41 @@ def compute_sample_weights(df: pd.DataFrame) -> np.ndarray:
 
 
 # ============================================================
+# CREATE TFS FOR EACH DATASET
+# ============================================================
+
+
+sipakmed_root = Path("./datasets/data/sipakmed")
+herlev_root = Path("./datasets/data/smear2005")
+apacc_root = Path("./datasets/data/apacc")
+
+sipakmed_df = scan_sipakmed(sipakmed_root, num_folds=5, seed=42, test_size=0.2)
+herlev_df = scan_herlev(herlev_root, num_folds=5, seed=42, test_size=0.2)
+apacc_df = scan_apacc(apacc_root, num_folds=5, seed=42)
+
+# Build transforms from stats file (or compute & save if missing)
+SIPAKMED_TRAIN_TF, SIPAKMED_VAL_TF = make_tf_from_stats(
+    sipakmed_df,
+    dataset_name="sipakmed",
+    stats_path=NORM_STATS_PATH,
+    split_for_norm="train_dev",
+)
+
+HERLEV_TRAIN_TF, HERLEV_VAL_TF = make_tf_from_stats(
+    herlev_df,
+    dataset_name="herlev",
+    stats_path=NORM_STATS_PATH,
+    split_for_norm="train_dev",
+)
+
+APACC_TRAIN_TF, APACC_VAL_TF = make_tf_from_stats(
+    apacc_df,
+    dataset_name="apacc",
+    stats_path=NORM_STATS_PATH,
+    split_for_norm="train_dev",
+)
+
+# ============================================================
 # LOADERS (ONLY TRAIN_DEV SPLIT)
 # ============================================================
 
@@ -680,53 +714,3 @@ def get_loaders(
         pin_memory=pin_memory,
     )
     return train_loader, val_loader
-
-
-# ============================================================
-# EXAMPLE USAGE (commented)
-# ============================================================
-#
-if __name__ == "__main__":
-    sipak_root = Path("./data/sipakmed")
-    herlev_root = Path("./data/smear2005")
-    apacc_root = Path("./data/apacc")
-
-    sipak_df = scan_sipakmed(sipak_root, num_folds=5, seed=42, test_size=0.2)
-    herlev_df = scan_herlev(herlev_root, num_folds=5, seed=42, test_size=0.2)
-    apacc_df = scan_apacc(apacc_root, num_folds=5, seed=42)
-    print("SIPAKMED samples:", len(sipak_df))
-    print("HERLEV samples:", len(herlev_df))
-    print("APACC samples:", len(apacc_df))
-    
-    # Build transforms from stats file (or compute & save if missing)
-    SIPAK_TRAIN_TF, SIPAK_VAL_TF = make_tf_from_stats(
-        sipak_df,
-        dataset_name="sipakmed",
-        stats_path=NORM_STATS_PATH,
-        split_for_norm="train_dev",
-    )
-
-    HERLEV_TRAIN_TF, HERLEV_VAL_TF = make_tf_from_stats(
-        herlev_df,
-        dataset_name="herlev",
-        stats_path=NORM_STATS_PATH,
-        split_for_norm="train_dev",
-    )
-
-    APACC_TRAIN_TF, APACC_VAL_TF = make_tf_from_stats(
-        apacc_df,
-        dataset_name="apacc",
-        stats_path=NORM_STATS_PATH,
-        split_for_norm="train_dev",
-    )
-
-    # Example: get loaders for SIPAKMED, fold 0
-    train_loader, val_loader = get_loaders_weighted(
-        sipak_df,
-        fold=0,
-        batch_size=32,
-        pin_memory=True,
-        num_workers=4,
-        train_tf=SIPAK_TRAIN_TF,
-        val_tf=SIPAK_VAL_TF,
-    )

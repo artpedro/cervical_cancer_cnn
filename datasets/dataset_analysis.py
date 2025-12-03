@@ -1,250 +1,252 @@
 from __future__ import annotations
-import hashlib, random
+
+import math
+from collections import Counter
 from pathlib import Path
-from typing import Optional
+from typing import Literal
 
 import matplotlib.pyplot as plt
-import numpy as np
 import pandas as pd
-from PIL import Image
 import torch
+from torch.utils.data import DataLoader
 import torchvision.transforms as T
-from tqdm import tqdm
 
-from cervical_cancer_cnn.datasets.apacc import (
+from datasets import (
+    scan_sipakmed,
+    scan_herlev,
     scan_apacc,
-    ApaccDataset,
-    train_tf,
-    val_tf,
+    HERLEV_TRAIN_TF,
+    HERLEV_VAL_TF,
+    SIPAKMED_TRAIN_TF,
+    SIPAKMED_VAL_TF,
+    APACC_TRAIN_TF,
+    APACC_VAL_TF,
+    get_loaders_weighted,
 )
+
 
 def without_normalize(tf: T.Compose) -> T.Compose:
     """Return a copy of a Compose transform with the final Normalize removed."""
     ops = list(tf.transforms)
     if isinstance(ops[-1], T.Normalize):
-        ops = ops[:-1]                      # drop it
+        ops = ops[:-1]  # drop it
     return T.Compose(ops)
 
-train_tf_no_norm = without_normalize(train_tf)   # uses your Resize/Crop/Jitter…
-val_tf_no_norm   = without_normalize(val_tf)
 
 # --------------------------------------------------------------------------
 #  1.  Textual class-balance report
 # --------------------------------------------------------------------------
 def report_class_balance(df: pd.DataFrame, num_folds: int) -> None:
-    """Print overall and per-fold counts."""
-    def pretty(series: pd.Series) -> str:
-        return " / ".join(f"{cls}:{n}" for cls, n in series.items())
+    """
+    Print overall and per-fold class balance (counts and percentages)
+    for binary_idx / binary_label.
+    """
+    # Consistent class order
+    classes = sorted(df["binary_idx"].unique())
+    # If you want human-readable names:
+    label_names = (
+        df[["binary_idx", "binary_label"]]
+        .drop_duplicates()
+        .set_index("binary_idx")["binary_label"]
+        .to_dict()
+    )
 
-    print("\n=== Class balance ------------------------------------------------")
-    total = df.binary_idx.value_counts().sort_index()
-    print(f"TOTAL      : {pretty(total)}")
+    def format_counts(series: pd.Series) -> str:
+        """Return 'cls_name: count (xx.x%)' joined by ' | '."""
+        total = int(series.sum())
+        if total == 0:
+            return "no samples"
+        parts = []
+        for cls in classes:
+            count = int(series.get(cls, 0))
+            pct = 100.0 * count / total if total > 0 else 0.0
+            cls_name = label_names.get(cls, str(cls))
+            parts.append(f"{cls_name}={count:4d} ({pct:5.1f}%)")
+        return " | ".join(parts)
 
-    test = df.query("split == 'test'").binary_idx.value_counts().sort_index()
-    print(f"TEST split : {pretty(test)}")
+    print("\n=== Class balance =================================================")
 
-    trainval = df.query("split == 'train'")
+    # ---- TOTAL ----
+    total_counts = df["binary_idx"].value_counts().reindex(classes, fill_value=0)
+    print(f"TOTAL (N={len(df)}):")
+    print("  " + format_counts(total_counts))
+
+    # ---- PER FOLD ----
     for f in range(num_folds):
-        train = trainval.query("fold != @f").binary_idx.value_counts().sort_index()
-        val   = trainval.query("fold == @f").binary_idx.value_counts().sort_index()
-        print(f"Fold {f}  train: {pretty(train):15s}  |  val: {pretty(val)}")
+        train_counts = (
+            df.query("fold != @f")["binary_idx"]
+            .value_counts()
+            .reindex(classes, fill_value=0)
+        )
+        val_counts = (
+            df.query("fold == @f")["binary_idx"]
+            .value_counts()
+            .reindex(classes, fill_value=0)
+        )
 
-import torch
-from torch.utils.data import DataLoader
-from tqdm import tqdm
+        n_train = int(train_counts.sum())
+        n_val = int(val_counts.sum())
 
-def mean_std_simple(loader, device="cuda"):
-    n_px = 0
-    channel_sum = torch.zeros(3, device=device)
-    channel_sq  = torch.zeros(3, device=device)
+        print(f"\nFold {f}:")
+        print(f"  train (N={n_train:4d}): {format_counts(train_counts)}")
+        print(f"  val   (N={n_val:4d}): {format_counts(val_counts)}")
+    print("==================================================================")
 
-    for batch, _ in loader:
-        batch = batch.to(device, non_blocking=True)  # B,C,H,W in 0-1
-        b, c, h, w = batch.shape
-        n_px += b * h * w
-        channel_sum += batch.sum(dim=[0,2,3])
-        channel_sq  += (batch ** 2).sum(dim=[0,2,3])
 
-    mean = channel_sum / n_px
-    std  = (channel_sq / n_px - mean ** 2).sqrt()
-    return mean.cpu(), std.cpu()
-
-def compute_mean_std(
-    df_train: pd.DataFrame,
-    tf_no_norm: T.Compose,
-    batch_size: int = 64,
-    num_workers: int = 4,
-    max_samples: int | None = None,
-    device: torch.device | str = "cuda",
-) -> tuple[torch.Tensor, torch.Tensor]:
+def inspect_batch_class_ratios(
+    loader: DataLoader,
+    dataset_name: str,
+    split: Literal["train", "val"],
+    n_batches: int = 5,
+) -> None:
     """
-    One-pass channel-wise mean / std. Uses Welford’s algorithm for numerical stability.
+    Quickly print class ratios for the first `n_batches` of a loader.
+    This is cheap and gives a good sense of whether sampling is working.
     """
-    ds = ApaccDataset(df_train, tf_no_norm)      # or Smear2005BinaryDataset, …
-    if max_samples:
-        ds = torch.utils.data.Subset(ds, range(max_samples))
-    loader = DataLoader(ds, batch_size=batch_size, shuffle=False,
-                        num_workers=num_workers, pin_memory=True)
+    total_counts: Counter[int] = Counter()
+    total_samples = 0
 
-    n_pixels = 0
-    mean = torch.zeros(3, device=device)
-    M2   = torch.zeros(3, device=device)   # sum of squared deviations
+    print(
+        f"\n=== {dataset_name.upper()} [{split}] batch-wise class ratios "
+        f"(first {n_batches} batches) ==="
+    )
 
-    for batch, _ in tqdm(loader, desc="scanning"):
-        batch = batch.to(device, non_blocking=True)   # shape B×C×H×W, 0-1
-        pixels = batch.numel() // 3                   # B*H*W
-        n_pixels += pixels
-        batch = batch.view(3, -1)                     # C × (B*H*W)
+    for batch_idx, batch in enumerate(loader):
+        if batch_idx >= n_batches:
+            break
 
-        # incremental mean / var
-        delta = batch.mean(1) - mean
-        mean += delta * (pixels / n_pixels)
-        M2   += (batch.var(1, unbiased=False) * pixels +
-                 (delta ** 2) * (n_pixels - pixels) * pixels / n_pixels)
+        # Assumes batch is (images, labels, ...)
+        images, labels = batch[0], batch[1]
 
-    var = M2 / n_pixels
-    std = torch.sqrt(var)
+        # Move labels to CPU numpy for counting
+        if isinstance(labels, torch.Tensor):
+            labels_np = labels.detach().cpu().numpy()
+        else:
+            labels_np = labels  # in case they are already numpy/ list
 
-    n_px = 0
-    channel_sum = torch.zeros(3, device=device)
-    channel_sq  = torch.zeros(3, device=device)
+        batch_counts = Counter(labels_np)
+        batch_size = len(labels_np)
 
-    for batch, _ in loader:
-        batch = batch.to(device, non_blocking=True)  # B,C,H,W in 0-1
-        b, c, h, w = batch.shape
-        n_px += b * h * w
-        channel_sum += batch.sum(dim=[0,2,3])
-        channel_sq  += (batch ** 2).sum(dim=[0,2,3])
+        total_counts.update(batch_counts)
+        total_samples += batch_size
 
-    mean_simple = channel_sum / n_px
-    std_simple  = (channel_sq / n_px - mean ** 2).sqrt()
-    print('simple mean', mean_simple, 'simple std', std_simple)
-    
-    return mean.cpu(), std.cpu()
+        # Print per-batch ratio
+        print(f"Batch {batch_idx:02d}: ", end="")
+        for cls in sorted(batch_counts.keys()):
+            cnt = batch_counts[cls]
+            ratio = cnt / batch_size
+            print(f"cls {cls}: {cnt:3d} ({ratio:6.2%})  ", end="")
+        print()
 
-# --------------------------------------------------------------------------
-#  2.  Transform visualisation helper
-# --------------------------------------------------------------------------
-def show_transforms(df: pd.DataFrame, n: int = 4, seed: int = 0) -> None:
-    """Randomly pick n images and visualise original vs. train_tf vs. val_tf."""
-    rng = random.Random(seed)
-    sample_paths = rng.sample(df.path.tolist(), n)
+    # Aggregated over inspected batches
+    print(f"\nAggregated over {min(n_batches, len(loader))} batches:")
+    for cls in sorted(total_counts.keys()):
+        cnt = total_counts[cls]
+        ratio = cnt / total_samples
+        print(f"  cls {cls}: {cnt:4d} ({ratio:6.2%})")
+    print()
 
-    ncols = 3
-    fig, axes = plt.subplots(n, ncols, figsize=(4.5 * ncols, 4.5 * n))
-    titles = ["original", "train_tf", "val_tf"]
 
-    for r, path in enumerate(sample_paths):
-        print(path)
-        img_pil = Image.open(path).convert("RGB")
-        imgs = [
-            img_pil,
-            train_tf(img_pil).permute(1, 2, 0).numpy(),  # CHW → HWC
-            val_tf(img_pil).permute(1, 2, 0).numpy(),
-        ]
-        for c, im in enumerate(imgs):
-            ax = axes[r, c] if n > 1 else axes[c]
-            ax.imshow(np.clip(im, 0, 1))
-            ax.axis("off")
-            if r == 0:
-                ax.set_title(titles[c], fontsize=14)
+def show_one_batch_grid(
+    loader: DataLoader,
+    dataset_name: str,
+    split: str,
+    max_images: int = 16,
+) -> None:
+    """
+    Show a small grid of images and their labels from the first batch
+    of the given loader.
+    """
+    batch = next(iter(loader))
+    images, labels = batch[0], batch[1]
+
+    # Convert to CPU
+    if isinstance(images, torch.Tensor):
+        images = images.detach().cpu()
+    if isinstance(labels, torch.Tensor):
+        labels = labels.detach().cpu().numpy()
+
+    n = min(max_images, images.shape[0])
+    rows = int(math.sqrt(n))
+    cols = math.ceil(n / rows)
+
+    plt.figure(figsize=(cols * 2.2, rows * 2.2))
+    for i in range(n):
+        img = images[i]
+        # assume (C, H, W), unnormalize very roughly if needed
+        if img.ndim == 3 and img.shape[0] in (1, 3):
+            img_np = img.permute(1, 2, 0).numpy()
+        else:
+            img_np = img.numpy()
+
+        plt.subplot(rows, cols, i + 1)
+        plt.imshow(img_np.squeeze(), cmap="gray" if img_np.ndim == 2 else None)
+        plt.axis("off")
+        plt.title(f"y={labels[i]}")
+    plt.suptitle(f"{dataset_name.upper()} [{split}] – first batch samples")
     plt.tight_layout()
     plt.show()
 
 
 # --------------------------------------------------------------------------
-#  3.  Image-size distribution
-# --------------------------------------------------------------------------
-def plot_size_distribution(df: pd.DataFrame, max_images: Optional[int] = None) -> None:
-    """Histogram width, height, area."""
-    paths = df.path.tolist()
-    if max_images:
-        paths = random.sample(paths, max_images)
-
-    widths, heights = [], []
-    for p in tqdm(paths, desc="Reading sizes"):
-        with Image.open(p) as im:
-            w, h = im.size
-            widths.append(w)
-            heights.append(h)
-    widths, heights = np.array(widths), np.array(heights)
-    areas = widths * heights
-
-    # 3 histograms
-    fig, ax = plt.subplots(3, 1, figsize=(7, 9))
-    ax[0].hist(widths, bins=30);   ax[0].set_title("Width distribution")
-    ax[1].hist(heights, bins=30);  ax[1].set_title("Height distribution")
-    ax[2].hist(areas, bins=30);    ax[2].set_title("Area (W×H) distribution")
-    plt.tight_layout(); plt.show()
-
-    print(f"Median WxH: {np.median(widths)} × {np.median(heights)}")
-    print(f"Min WxH   : {widths.min()} × {heights.min()}")
-    print(f"Max WxH   : {widths.max()} × {heights.max()}")
-
-
-# --------------------------------------------------------------------------
-#  4.  Duplicate-file check (hash based)
-# --------------------------------------------------------------------------
-def check_duplicates(df: pd.DataFrame, max_bytes: int = 2**20) -> None:
-    """
-    Spot potential duplicates by hashing the *first* `max_bytes` of each file.
-    Cheap but usually enough for image sets.
-    """
-    print("\n=== Duplicate file check ----------------------------------------")
-    hashes = {}
-    dups = []
-    for path in tqdm(df.path, desc="Hashing"):
-        h = hashlib.sha1(open(path, "rb").read(max_bytes)).hexdigest()
-        if h in hashes:
-            dups.append((hashes[h], path))
-        else:
-            hashes[h] = path
-    if not dups:
-        print("No duplicates detected (within sampled bytes).")
-        return
-    print(f"⚠️  Found {len(dups)} potential duplicates (SHA-1 on first {max_bytes//1024} KB).")
-    for a, b in dups[:10]:
-        print("   ", a, "<---->", b)
-    if len(dups) > 10:
-        print("   …")
-
-
-# --------------------------------------------------------------------------
-#  5.  File-type distribution
-# --------------------------------------------------------------------------
-def filetype_breakdown(df: pd.DataFrame) -> None:
-    counts = df.path.apply(lambda p: Path(p).suffix.lower()).value_counts()
-    print("\n=== File-type distribution --------------------------------------")
-    for ext, n in counts.items():
-        print(f"{ext or '[no ext]':>8s} : {n}")
-
-
-# --------------------------------------------------------------------------
-#  6.  Main
+#  2.  Main
 # --------------------------------------------------------------------------
 def main() -> None:
-    
-    ROOT = Path("./datasets/apacc")  
     NUM_FOLDS, SEED = 5, 42
 
-    df = scan_apacc(ROOT, num_folds=NUM_FOLDS, seed=SEED)
+    names = ["sipakmed", "herlev", "apacc"]
 
-    # 6-A  class balance
-    report_class_balance(df, NUM_FOLDS)
+    roots = [
+        Path("./datasets/data/sipakmed"),
+        Path("./datasets/data/smear2005"),
+        Path("./datasets/data/apacc"),
+    ]
 
-    # 6-B  transform visualisation
-    show_transforms(df.query("split == 'train'"), n=5, seed=SEED)
+    scanners = [scan_sipakmed, scan_herlev, scan_apacc]
 
-    train_df = df.query("split == 'train'")
-    mean, std = compute_mean_std(train_df, train_tf_no_norm, batch_size=128)
-    print("channel-wise mean :", mean.tolist())
-    print("channel-wise std  :", std.tolist())
-    # 6-C  image-size histogram
-    #plot_size_distribution(df, max_images=None)  # set to e.g. 2000 for speed
+    all_tfs = [
+        (HERLEV_TRAIN_TF, HERLEV_VAL_TF),
+        (SIPAKMED_TRAIN_TF, SIPAKMED_VAL_TF),
+        (APACC_TRAIN_TF, APACC_VAL_TF),
+    ]
 
-    # 6-D  misc sanity checks
-    #filetype_breakdown(df)
-    #check_duplicates(df, max_bytes=2**18)   # 256 KB
+    for name, root, scanner, tfs in zip(names, roots, scanners, all_tfs):
+        print(f"\n==================== {name.upper()} ====================")
+
+        df = scanner(root, num_folds=NUM_FOLDS, seed=SEED)
+
+        # 1) class balance
+        report_class_balance(df, NUM_FOLDS)
+        train_tf, val_tf = tfs
+
+        train_tf_no_norm = without_normalize(train_tf)  # uses your Resize/Crop/Jitter…
+        val_tf_no_norm = without_normalize(val_tf)
+
+        train_loader, val_loader = get_loaders_weighted(
+            df,
+            fold=0,
+            batch_size=32,
+            num_workers=4,
+            pin_memory=True,
+            train_tf=train_tf_no_norm,
+            val_tf=val_tf_no_norm,
+        )
+
+        # 2) QUICK NUMERIC CHECK: batch-wise class ratios
+        inspect_batch_class_ratios(
+            train_loader, dataset_name=name, split="train", n_batches=5
+        )
+        inspect_batch_class_ratios(
+            val_loader, dataset_name=name, split="val", n_batches=5
+        )
+
+        # 3) OPTIONAL VISUAL CHECK: show one batch grid
+        show_one_batch_grid(
+            train_loader, dataset_name=name, split="train", max_images=16
+        )
+        show_one_batch_grid(
+            val_loader, dataset_name=name, split="val", max_images=16
+        )
 
 
 if __name__ == "__main__":

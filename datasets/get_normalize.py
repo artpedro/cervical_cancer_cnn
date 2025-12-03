@@ -1,13 +1,4 @@
 #!/usr/bin/env python
-"""
-compute_dataset_stats.py – reproducible μ/σ for every dataset (Windows-safe)
-
-• Works with helper modules that expose:
-      scan_<name>(root, num_folds, seed)  -> DataFrame
-      <Name>Dataset                       -> __init__(df, transform)
-      val_tf (or eval_tf)                 -> deterministic eval transform
-• Writes one YAML file: dataset_stats.yaml
-"""
 from __future__ import annotations
 import importlib, random, yaml
 from pathlib import Path
@@ -25,7 +16,7 @@ DATASETS = {
     "herlev"  : {"root": r"herlev",   "module": "herlev","num_folds": 5},
     "sipakmed"   : {"root": r"sipakmed",    "module": "sipakmed", "num_folds": 5},
 }
-OUT_YAML = Path(".\dataset_stats.yaml")
+OUT_YAML = Path(".\dataset_stats_entire.yaml")
 NUM_WORKERS = 4            # set 0 to avoid multiprocessing entirely
 # ──────────────────────────────────────
 

@@ -50,8 +50,8 @@ torch.backends.cudnn.benchmark = False
 DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 DATA_DIR = Path(os.getenv("DATA_DIR", ".\\workspace\\data"))
-METRICS_DIR = Path(os.getenv("METRICS_DIR", ".\\workspace\\metrics_flex"))
-RUNS_DIR = Path(os.getenv("RUNS_DIR", ".\\workspace\\runs_flex"))
+METRICS_DIR = Path(os.getenv("METRICS_DIR", ".\\workspace\\metrics"))
+RUNS_DIR = Path(os.getenv("RUNS_DIR", ".\\workspace\\runs"))
 
 BATCH_SIZE = 32
 NUM_WORKERS = int(os.getenv("NUM_WORKERS", 2))
@@ -63,7 +63,7 @@ WEIGHT_DECAY = 5e-3
 SCHEDULER_MILESTONES = [10, 20]
 SCHEDULER_GAMMA = 0.1
 
-# change here if you want a global default
+# global default – can be overridden by env var or CLI later
 BALANCE_MODE = os.getenv("BALANCE_MODE", "weighted_loader")
 # allowed: "weighted_loader", "weighted_loss", "none"
 
@@ -138,7 +138,6 @@ def _run_epoch(
 
     total_loss, preds, trues = 0.0, [], []
 
-    # Create a description for the progress bar
     desc = f"Epoch {epoch_num:02d} ({split_name.capitalize()})"
     progress_bar = tqdm(dataloader, desc=desc, leave=True)
 
@@ -172,10 +171,13 @@ def _run_epoch(
 # ----------------------------
 
 
-def _setup_run_dir(metrics_dir: Path, suffix: str = "") -> Path:
+def _setup_run_dir(metrics_dir: Path, dataset_name: str, balance_mode: str) -> Path:
+    """
+    Create a run directory like:
+      metrics_dir / <dataset_name> / <balance_mode> / <timestamp>/
+    """
     ts = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    name = f"{ts}_{suffix}" if suffix else ts
-    run_dir = metrics_dir / name
+    run_dir = metrics_dir / dataset_name / balance_mode / ts
     (run_dir / "checkpoints").mkdir(parents=True, exist_ok=True)
     return run_dir
 
@@ -224,6 +226,7 @@ def train_dataset(
 
     print(f"\n{'=' * 70}")
     print(f"DATASET: {name.upper()}  |  balance_mode = {balance_mode}")
+    print(f"Run directory: {run_dir}")
     print(f"{'=' * 70}")
 
     # -------------------------------
@@ -265,6 +268,9 @@ def train_dataset(
     # -------------------------------
     (run_dir / "checkpoints").mkdir(parents=True, exist_ok=True)
 
+    epoch_file = run_dir / f"epoch_logs_{name}_{balance_mode}.csv"
+    summary_file = run_dir / f"summary_{name}_{balance_mode}.csv"
+
     epoch_cols = [
         "dataset",
         "model",
@@ -282,7 +288,7 @@ def train_dataset(
         "lr",
         "seconds",
     ]
-    pd.DataFrame(columns=epoch_cols).to_csv(run_dir / "epoch_logs.csv", index=False)
+    pd.DataFrame(columns=epoch_cols).to_csv(epoch_file, index=False)
 
     summary_cols = [
         "dataset",
@@ -297,7 +303,7 @@ def train_dataset(
         "best_npv",
         "fold",
     ]
-    pd.DataFrame(columns=summary_cols).to_csv(run_dir / "summary.csv", index=False)
+    pd.DataFrame(columns=summary_cols).to_csv(summary_file, index=False)
 
     if scheduler_milestones is None:
         scheduler_milestones = SCHEDULER_MILESTONES
@@ -389,7 +395,7 @@ def train_dataset(
                         seconds=duration,
                     )
                     pd.DataFrame([row_data]).to_csv(
-                        run_dir / "epoch_logs.csv",
+                        epoch_file,
                         mode="a",
                         header=False,
                         index=False,
@@ -399,9 +405,10 @@ def train_dataset(
                 if val_m["acc"] > best_val["acc"]:
                     best_val.update(val_m)
                     best_val["epoch"] = epoch
+                    ckpt_name = f"{name}_{backbone_id}_{balance_mode}_best_fold{fold}.pt"
                     torch.save(
                         model.state_dict(),
-                        run_dir / "checkpoints" / f"{name}_{backbone_id}_best_{fold}.pt",
+                        run_dir / "checkpoints" / ckpt_name,
                     )
 
                 if epoch == 1 or epoch % 5 == 0 or epoch == epochs:
@@ -425,7 +432,7 @@ def train_dataset(
                 fold,
             ]
             pd.DataFrame([summary_row], columns=summary_cols).to_csv(
-                run_dir / "summary.csv",
+                summary_file,
                 mode="a",
                 header=False,
                 index=False,
@@ -481,7 +488,7 @@ def main():
         print(f"\nScanning dataset: {name} at {root}")
         df = scanner(root=root, num_folds=NUM_FOLDS, seed=SEED)
 
-        run_dir = _setup_run_dir(METRICS_DIR, suffix=BALANCE_MODE)
+        run_dir = _setup_run_dir(METRICS_DIR, dataset_name=name, balance_mode=BALANCE_MODE)
 
         train_dataset(
             name=name,

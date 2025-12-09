@@ -459,8 +459,6 @@ def main():
     print("  - weighted_loader : WeightedRandomSampler + unweighted loss")
     print("  - weighted_loss   : standard loaders + weighted loss")
     print("  - none            : standard loaders + unweighted loss")
-    print("=" * 70)
-    print(f"BALANCE_MODE = {BALANCE_MODE}")
     print("=" * 70 + "\n")
 
     names = ["apacc", "herlev", "sipakmed"]
@@ -470,6 +468,8 @@ def main():
         Path("./datasets/data/sipakmed"),
     ]
     scanners = [scan_apacc, scan_herlev, scan_sipakmed]
+
+    balance_modes = ["weighted_loader", "weighted_loss", "none"]
 
     for root, scanner, name in zip(roots, scanners, names):
         # dataset-specific model list if needed
@@ -488,29 +488,35 @@ def main():
         print(f"\nScanning dataset: {name} at {root}")
         df = scanner(root=root, num_folds=NUM_FOLDS, seed=SEED)
 
-        run_dir = _setup_run_dir(METRICS_DIR, dataset_name=name, balance_mode=BALANCE_MODE)
+        for balance_mode in balance_modes:
+            print("\n" + "-" * 70)
+            print(f"Starting training on {name} with balance_mode = '{balance_mode}'")
+            print("-" * 70 + "\n")
 
-        train_dataset(
-            name=name,
-            df=df,
-            run_dir=run_dir,
-            models=models,
-            balance_mode=BALANCE_MODE,
-            num_folds=NUM_FOLDS,
-            batch_size=BATCH_SIZE,
-            num_workers=NUM_WORKERS,
-            epochs=EPOCHS,
-            lr=LR,
-            momentum=MOMENTUM,
-            weight_decay=WEIGHT_DECAY,
-            scheduler_milestones=SCHEDULER_MILESTONES,
-            scheduler_gamma=SCHEDULER_GAMMA,
-            device=DEVICE,
-        )
+            run_dir = _setup_run_dir(METRICS_DIR, dataset_name=name, balance_mode=balance_mode)
+
+            train_dataset(
+                name=name,
+                df=df,
+                run_dir=run_dir,
+                models=models,
+                balance_mode=balance_mode,
+                num_folds=NUM_FOLDS,
+                batch_size=BATCH_SIZE,
+                num_workers=NUM_WORKERS,
+                epochs=EPOCHS,
+                lr=LR,
+                momentum=MOMENTUM,
+                weight_decay=WEIGHT_DECAY,
+                scheduler_milestones=SCHEDULER_MILESTONES,
+                scheduler_gamma=SCHEDULER_GAMMA,
+                device=DEVICE,
+            )
 
     print("\n" + "=" * 70)
-    print("TRAINING COMPLETE")
+    print("TRAINING COMPLETE (all datasets, all balance modes)")
     print("=" * 70 + "\n")
+
 
 
 if __name__ == "__main__":

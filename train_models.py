@@ -9,14 +9,21 @@ import os, random, csv, warnings, datetime, time
 import pandas as pd
 import numpy as np
 
-# Datasets
+# Datasets and loaders
 from datasets.datasets import (
     scan_sipakmed,
     scan_herlev,
     scan_apacc,
     get_loaders,
     get_loaders_weighted,
+    APACC_TRAIN_TF,
+    APACC_VAL_TF,
+    SIPAKMED_TRAIN_TF,
+    SIPAKMED_VAL_TF,
+    HERLEV_TRAIN_TF,
+    HERLEV_VAL_TF,
 )
+
 
 # Models
 import torch
@@ -55,8 +62,8 @@ RUNS_DIR = Path(os.getenv("RUNS_DIR", ".\\workspace\\runs"))
 
 BATCH_SIZE = 32
 NUM_WORKERS = int(os.getenv("NUM_WORKERS", 2))
-NUM_FOLDS = 5
-EPOCHS = 25
+NUM_FOLDS = 2
+EPOCHS = 1
 LR = 5e-4
 MOMENTUM = 0.9
 WEIGHT_DECAY = 5e-3
@@ -112,7 +119,9 @@ def compute_class_weights(df: pd.DataFrame, device: torch.device) -> torch.Tenso
     freq = df["binary_idx"].value_counts(normalize=True).sort_index()
     if freq.size != 2:
         raise ValueError("Expected two classes, got " + str(freq.to_dict()))
-    return torch.tensor([1.0 / freq[0], 1.0 / freq[1]], dtype=torch.float32, device=device)
+    return torch.tensor(
+        [1.0 / freq[0], 1.0 / freq[1]], dtype=torch.float32, device=device
+    )
 
 
 # ----------------------------
@@ -186,7 +195,6 @@ def _setup_run_dir(metrics_dir: Path, dataset_name: str, balance_mode: str) -> P
 # Flexible training function
 # ----------------------------
 
-
 def train_dataset(
     name: str,
     df: pd.DataFrame,
@@ -204,6 +212,8 @@ def train_dataset(
     scheduler_milestones: list[int] | None = None,
     scheduler_gamma: float = SCHEDULER_GAMMA,
     device: torch.device = DEVICE,
+    train_tf=None,
+    val_tf=None,
 ) -> None:
     """
     Train all models in `models` on a single dataset using one of three modes:
@@ -234,7 +244,9 @@ def train_dataset(
     # -------------------------------
     if "split" in df.columns:
         train_df = df[df["split"].isin(["train", "train_dev"])].reset_index(drop=True)
-        print(f"Using rows with split in ('train','train_dev') for training (rows: {len(train_df)})")
+        print(
+            f"Using rows with split in ('train','train_dev') for training (rows: {len(train_df)})"
+        )
     else:
         train_df = df.reset_index(drop=True)
         print(f"No 'split' column found; using all {len(train_df)} rows for training.")
@@ -245,19 +257,31 @@ def train_dataset(
     class_dist = train_df["binary_idx"].value_counts().sort_index()
     total = len(train_df)
     print(f"\nClass Distribution (training subset):")
-    print(f"  Class 0 (Normal):   {class_dist.get(0, 0):>6} samples ({100 * class_dist.get(0, 0) / total:5.1f}%)")
+    print(
+        f"  Class 0 (Normal):   {class_dist.get(0, 0):>6} samples ({100 * class_dist.get(0, 0) / total:5.1f}%)"
+    )
     if 1 in class_dist.index:
-        print(f"  Class 1 (Abnormal): {class_dist.get(1, 0):>6} samples ({100 * class_dist.get(1, 0) / total:5.1f}%)")
+        print(
+            f"  Class 1 (Abnormal): {class_dist.get(1, 0):>6} samples ({100 * class_dist.get(1, 0) / total:5.1f}%)"
+        )
         if class_dist.get(0, 0) > 0 and class_dist.get(1, 0) > 0:
-            imbalance_ratio = max(class_dist[0], class_dist[1]) / min(class_dist[0], class_dist[1])
+            imbalance_ratio = max(class_dist[0], class_dist[1]) / min(
+                class_dist[0], class_dist[1]
+            )
             print(f"  Imbalance Ratio: {imbalance_ratio:.2f}:1")
 
     if balance_mode == "weighted_loader":
-        print("\n→ Using WeightedRandomSampler, criterion = CrossEntropyLoss (no class weights).")
+        print(
+            "\n→ Using WeightedRandomSampler, criterion = CrossEntropyLoss (no class weights)."
+        )
     elif balance_mode == "weighted_loss":
-        print("\n→ Using standard DataLoader, criterion = CrossEntropyLoss(class_weights) per fold.")
+        print(
+            "\n→ Using standard DataLoader, criterion = CrossEntropyLoss(class_weights) per fold."
+        )
     else:
-        print("\n→ Using standard DataLoader, criterion = CrossEntropyLoss (no balancing).")
+        print(
+            "\n→ Using standard DataLoader, criterion = CrossEntropyLoss (no balancing)."
+        )
 
     print(f"\nUsing device: {device}")
     if torch.cuda.is_available():
@@ -324,6 +348,8 @@ def train_dataset(
                     batch_size=batch_size,
                     num_workers=num_workers,
                     pin_memory=torch.cuda.is_available(),
+                    train_tf=train_tf,
+                    val_tf=val_tf,
                 )
                 criterion = nn.CrossEntropyLoss()
 
@@ -335,6 +361,8 @@ def train_dataset(
                     batch_size=batch_size,
                     num_workers=num_workers,
                     pin_memory=torch.cuda.is_available(),
+                    train_tf=train_tf,
+                    val_tf=val_tf,
                 )
 
                 if balance_mode == "weighted_loss":
@@ -342,9 +370,10 @@ def train_dataset(
                     train_mask = train_df["fold"] != fold
                     train_fold_df = train_df.loc[train_mask]
                     class_weights = compute_class_weights(train_fold_df, device=device)
-                    criterion = nn.CrossEntropyLoss(weight=class_weights)
                     print(f"  Fold {fold}: class weights = {class_weights.tolist()}")
+                    criterion = nn.CrossEntropyLoss(weight=class_weights)
                 else:
+                    # balance_mode == "none"
                     criterion = nn.CrossEntropyLoss()
 
             # --------- 2) model, optimiser, scheduler ---------
@@ -361,14 +390,18 @@ def train_dataset(
                 optimiser, milestones=scheduler_milestones, gamma=scheduler_gamma
             )
 
-            best_val = {k: 0.0 for k in ["acc", "prec", "rec", "spec", "f1", "ppv", "npv"]}
+            best_val = {
+                k: 0.0 for k in ["acc", "prec", "rec", "spec", "f1", "ppv", "npv"]
+            }
             best_val["epoch"] = 0
 
             # --------- 3) epoch loop ---------
             for epoch in range(1, epochs + 1):
                 t0 = time.time()
 
-                train_m = _run_epoch(train_loader, model, criterion, epoch, "train", optimiser)
+                train_m = _run_epoch(
+                    train_loader, model, criterion, epoch, "train", optimiser
+                )
                 val_m = _run_epoch(val_loader, model, criterion, epoch, "val")
 
                 scheduler.step()
@@ -405,7 +438,9 @@ def train_dataset(
                 if val_m["acc"] > best_val["acc"]:
                     best_val.update(val_m)
                     best_val["epoch"] = epoch
-                    ckpt_name = f"{name}_{backbone_id}_{balance_mode}_best_fold{fold}.pt"
+                    ckpt_name = (
+                        f"{name}_{backbone_id}_{balance_mode}_best_fold{fold}.pt"
+                    )
                     torch.save(
                         model.state_dict(),
                         run_dir / "checkpoints" / ckpt_name,
@@ -469,21 +504,26 @@ def main():
     ]
     scanners = [scan_apacc, scan_herlev, scan_sipakmed]
 
+    # map dataset name -> (train_tf, val_tf)
+    tf_map = {
+        "apacc": (APACC_TRAIN_TF, APACC_VAL_TF),
+        "herlev": (HERLEV_TRAIN_TF, HERLEV_VAL_TF),
+        "sipakmed": (SIPAKMED_TRAIN_TF, SIPAKMED_VAL_TF),
+    }
+
     balance_modes = ["weighted_loader", "weighted_loss", "none"]
 
     for root, scanner, name in zip(roots, scanners, names):
-        # dataset-specific model list if needed
-        if name == "apacc":
-            models = {f"EfficientNet-B{i}": f"efficientnet_b{i}" for i in range(4)}
-        else:
-            models = {
-                "SqueezeNet 1.1": "tv_squeezenet1_1",
-                "MobileNet V2 1.0x": "mobilenetv2_100",
-                "MobileNet V4 small": "mobilenetv4_conv_small.e2400_r224_in1k",
-                "ShuffleNet V2 1.0x": "tv_shufflenet_v2_x1_0",
-                # "GhostNet V3": "ghostnetv3_100.in1k",
-                **{f"EfficientNet-B{i}": f"efficientnet_b{i}" for i in range(4)},
-            }
+        models = {
+            **{f"EfficientNet-B{i}": f"efficientnet_b{i}" for i in range(7)},
+            "SqueezeNet 1.1": "tv_squeezenet1_1",
+            "MobileNet V2 1.0x": "mobilenetv2_100",
+            "MobileNet V4 small": "mobilenetv4_conv_small.e2400_r224_in1k",
+            "ShuffleNet V2 1.0x": "tv_shufflenet_v2_x1_0",
+            "GhostNet V3": "ghostnetv3_100.in1k",
+        }
+
+        train_tf, val_tf = tf_map[name]
 
         print(f"\nScanning dataset: {name} at {root}")
         df = scanner(root=root, num_folds=NUM_FOLDS, seed=SEED)
@@ -493,7 +533,9 @@ def main():
             print(f"Starting training on {name} with balance_mode = '{balance_mode}'")
             print("-" * 70 + "\n")
 
-            run_dir = _setup_run_dir(METRICS_DIR, dataset_name=name, balance_mode=balance_mode)
+            run_dir = _setup_run_dir(
+                METRICS_DIR, dataset_name=name, balance_mode=balance_mode
+            )
 
             train_dataset(
                 name=name,
@@ -511,12 +553,13 @@ def main():
                 scheduler_milestones=SCHEDULER_MILESTONES,
                 scheduler_gamma=SCHEDULER_GAMMA,
                 device=DEVICE,
+                train_tf=train_tf,
+                val_tf=val_tf,
             )
 
     print("\n" + "=" * 70)
-    print("TRAINING COMPLETE (all datasets, all balance modes)")
+    print("MOCK TRAINING COMPLETE (all datasets, all balance modes)")
     print("=" * 70 + "\n")
-
 
 
 if __name__ == "__main__":

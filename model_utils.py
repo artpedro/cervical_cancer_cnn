@@ -105,6 +105,16 @@ def load_any(name: str, num_classes: int = 2, pretrained: bool = True):
             "tv_shufflenet_v2_x1_0": tvm.shufflenet_v2_x1_0,
             "tv_mobilenet_v2": tvm.mobilenet_v2,
             "mobilenetv2_100": tvm.mobilenet_v2,
+
+            # EfficientNet family from torchvision (0.13+)
+            "efficientnet_b0": tvm.efficientnet_b0,
+            "efficientnet_b1": tvm.efficientnet_b1,
+            "efficientnet_b2": tvm.efficientnet_b2,
+            "efficientnet_b3": tvm.efficientnet_b3,
+            "efficientnet_b4": tvm.efficientnet_b4,
+            "efficientnet_b5": tvm.efficientnet_b5,
+            "efficientnet_b6": tvm.efficientnet_b6,
+            "efficientnet_b7": tvm.efficientnet_b7,
         }
         tv_ctor = tv_registry.get(name)
         if tv_ctor:

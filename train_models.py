@@ -30,16 +30,8 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 from torch.optim.lr_scheduler import MultiStepLR
+from torch.amp import autocast, GradScaler
 from model_utils import load_any
-
-# Metrics
-from sklearn.metrics import (
-    accuracy_score,
-    recall_score,
-    f1_score,
-    precision_score,
-    confusion_matrix,
-)
 
 import gc
 
@@ -51,8 +43,14 @@ SEED = 42
 random.seed(SEED)
 np.random.seed(SEED)
 torch.manual_seed(SEED)
-torch.backends.cudnn.deterministic = True
-torch.backends.cudnn.benchmark = False
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(SEED)
+
+# Faster settings (NOT fully deterministic, but still seeded)
+torch.backends.cudnn.deterministic = False
+torch.backends.cudnn.benchmark = True
+
+
 
 DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
@@ -62,8 +60,8 @@ RUNS_DIR = Path(os.getenv("RUNS_DIR", ".\\workspace\\runs"))
 
 BATCH_SIZE = 32
 NUM_WORKERS = int(os.getenv("NUM_WORKERS", 2))
-NUM_FOLDS = 2
-EPOCHS = 1
+NUM_FOLDS = 5
+EPOCHS = 25
 LR = 5e-4
 MOMENTUM = 0.9
 WEIGHT_DECAY = 5e-3
@@ -91,26 +89,6 @@ BASE_TODO = {
 # ----------------------------
 
 
-def _confusion_parts(y_true, y_pred) -> Tuple[int, int, int, int]:
-    tn, fp, fn, tp = confusion_matrix(y_true, y_pred, labels=[0, 1]).ravel()
-    return tn, fp, fn, tp
-
-
-def metrics_binary(y_true, y_pred) -> dict[str, float]:
-    """Return all requested binary-classification metrics in one dict."""
-    tn, fp, fn, tp = _confusion_parts(y_true, y_pred)
-
-    return {
-        "acc": accuracy_score(y_true, y_pred),
-        "prec": precision_score(y_true, y_pred, zero_division=0),  # PPV
-        "rec": recall_score(y_true, y_pred, zero_division=0),  # Sensitivity
-        "spec": tn / (tn + fp + EPS),
-        "f1": f1_score(y_true, y_pred, zero_division=0),
-        "ppv": tp / (tp + fp + EPS),  # same as precision
-        "npv": tn / (tn + fn + EPS),
-    }
-
-
 def compute_class_weights(df: pd.DataFrame, device: torch.device) -> torch.Tensor:
     """
     Compute inverse-frequency weights for binary classes.
@@ -127,8 +105,6 @@ def compute_class_weights(df: pd.DataFrame, device: torch.device) -> torch.Tenso
 # ----------------------------
 # Epoch runner
 # ----------------------------
-
-
 def _run_epoch(
     dataloader: DataLoader,
     model: nn.Module,
@@ -136,16 +112,23 @@ def _run_epoch(
     epoch_num: int,
     split_name: str,
     optimiser: Optional[torch.optim.Optimizer] = None,
+    *,
+    scaler: Optional[GradScaler] = None,
+    use_amp: bool = True,
+    device: torch.device = DEVICE,
 ) -> dict[str, float]:
-    """
-    Execute a single epoch with a tqdm progress bar.
-    - If optimiser is provided -> training mode, gradients ON.
-    - If optimiser is None     -> evaluation mode, gradients OFF.
-    """
     training = optimiser is not None
     model.train(training)
 
-    total_loss, preds, trues = 0.0, [], []
+    amp_enabled = bool(use_amp and torch.cuda.is_available() and device.type == "cuda")
+
+    total_loss = 0.0
+    n_samples = 0
+
+    tp = torch.zeros((), device=device, dtype=torch.int64)
+    tn = torch.zeros((), device=device, dtype=torch.int64)
+    fp = torch.zeros((), device=device, dtype=torch.int64)
+    fn = torch.zeros((), device=device, dtype=torch.int64)
 
     desc = f"Epoch {epoch_num:02d} ({split_name.capitalize()})"
     progress_bar = tqdm(dataloader, desc=desc, leave=True)
@@ -153,26 +136,65 @@ def _run_epoch(
     ctx = torch.enable_grad() if training else torch.no_grad()
     with ctx:
         for images, labels in progress_bar:
-            images, labels = images.to(DEVICE), labels.to(DEVICE)
-            logits = model(images)
-            loss = criterion(logits, labels)
+            images = images.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
+
+            bs = labels.size(0)
+            n_samples += bs
 
             if training:
-                optimiser.zero_grad()
-                loss.backward()
-                optimiser.step()
+                optimiser.zero_grad(set_to_none=True)
 
-            total_loss += loss.item() * labels.size(0)
-            preds.append(logits.detach().argmax(1).cpu())
-            trues.append(labels.cpu())
+            # NEW API: torch.amp.autocast("cuda", ...)
+            with autocast("cuda", enabled=amp_enabled):
+                logits = model(images)
+                loss = criterion(logits, labels)
 
-    y_pred = torch.cat(preds)
-    y_true = torch.cat(trues)
-    n = len(dataloader.dataset)
+            if training:
+                if amp_enabled:
+                    if scaler is None:
+                        raise ValueError("AMP enabled but scaler is None.")
+                    scaler.scale(loss).backward()
+                    scaler.step(optimiser)
+                    scaler.update()
+                else:
+                    loss.backward()
+                    optimiser.step()
 
-    metrics = metrics_binary(y_true, y_pred)
-    metrics["loss"] = total_loss / n
-    return metrics
+            total_loss += float(loss.detach().item()) * bs
+
+            pred = logits.detach().argmax(dim=1)
+
+            # Safer across torch versions (no sum(dtype=...) dependency)
+            tp += ((pred == 1) & (labels == 1)).sum().to(torch.int64)
+            tn += ((pred == 0) & (labels == 0)).sum().to(torch.int64)
+            fp += ((pred == 1) & (labels == 0)).sum().to(torch.int64)
+            fn += ((pred == 0) & (labels == 1)).sum().to(torch.int64)
+
+    tp_f = tp.to(torch.float32)
+    tn_f = tn.to(torch.float32)
+    fp_f = fp.to(torch.float32)
+    fn_f = fn.to(torch.float32)
+
+    acc = (tp_f + tn_f) / (tp_f + tn_f + fp_f + fn_f + EPS)
+    prec = tp_f / (tp_f + fp_f + EPS)
+    rec = tp_f / (tp_f + fn_f + EPS)
+    spec = tn_f / (tn_f + fp_f + EPS)
+    f1 = (2.0 * prec * rec) / (prec + rec + EPS)
+    ppv = prec
+    npv = tn_f / (tn_f + fn_f + EPS)
+
+    return {
+        "loss": total_loss / max(1, n_samples),
+        "acc": float(acc.item()),
+        "prec": float(prec.item()),
+        "rec": float(rec.item()),
+        "spec": float(spec.item()),
+        "f1": float(f1.item()),
+        "ppv": float(ppv.item()),
+        "npv": float(npv.item()),
+    }
+
 
 
 # ----------------------------
@@ -194,7 +216,6 @@ def _setup_run_dir(metrics_dir: Path, dataset_name: str, balance_mode: str) -> P
 # ----------------------------
 # Flexible training function
 # ----------------------------
-
 def train_dataset(
     name: str,
     df: pd.DataFrame,
@@ -214,23 +235,16 @@ def train_dataset(
     device: torch.device = DEVICE,
     train_tf=None,
     val_tf=None,
+    use_amp: bool = True,
+    results_csv: Path | None = None,
+    progress_cb=None,  # callable(**info)
 ) -> None:
     """
-    Train all models in `models` on a single dataset using one of three modes:
-
-    balance_mode ∈ {
-        "weighted_loader" : WeightedRandomSampler + unweighted CrossEntropyLoss
-        "weighted_loss"   : standard loaders + class-weighted CrossEntropyLoss
-        "none"            : standard loaders + unweighted CrossEntropyLoss
-    }
-
-    `df` must contain:
-      - 'path'
-      - 'binary_idx'
-      - 'fold'
-
-    Optionally:
-      - 'split' ∈ {"train","train_dev","test"}; only train/train_dev are used for training.
+    NEW:
+      - AMP support (use_amp=True) for speed on CUDA
+      - Metrics computed accurately on GPU via TP/TN/FP/FN accumulation (no sklearn)
+      - Per-config timing saved to results_csv after each model+fold finishes
+      - progress_cb called after each config
     """
     assert balance_mode in {"weighted_loader", "weighted_loss", "none"}
 
@@ -239,9 +253,6 @@ def train_dataset(
     print(f"Run directory: {run_dir}")
     print(f"{'=' * 70}")
 
-    # -------------------------------
-    # Restrict to training portion if split exists
-    # -------------------------------
     if "split" in df.columns:
         train_df = df[df["split"].isin(["train", "train_dev"])].reset_index(drop=True)
         print(
@@ -251,9 +262,6 @@ def train_dataset(
         train_df = df.reset_index(drop=True)
         print(f"No 'split' column found; using all {len(train_df)} rows for training.")
 
-    # -------------------------------
-    # Show class distribution in train_df
-    # -------------------------------
     class_dist = train_df["binary_idx"].value_counts().sort_index()
     total = len(train_df)
     print(f"\nClass Distribution (training subset):")
@@ -271,60 +279,33 @@ def train_dataset(
             print(f"  Imbalance Ratio: {imbalance_ratio:.2f}:1")
 
     if balance_mode == "weighted_loader":
-        print(
-            "\n→ Using WeightedRandomSampler, criterion = CrossEntropyLoss (no class weights)."
-        )
+        print("\n→ Using WeightedRandomSampler, criterion = CrossEntropyLoss (no class weights).")
     elif balance_mode == "weighted_loss":
-        print(
-            "\n→ Using standard DataLoader, criterion = CrossEntropyLoss(class_weights) per fold."
-        )
+        print("\n→ Using standard DataLoader, criterion = CrossEntropyLoss(class_weights) per fold.")
     else:
-        print(
-            "\n→ Using standard DataLoader, criterion = CrossEntropyLoss (no balancing)."
-        )
+        print("\n→ Using standard DataLoader, criterion = CrossEntropyLoss (no balancing).")
 
     print(f"\nUsing device: {device}")
     if torch.cuda.is_available():
         print(" GPU:", torch.cuda.get_device_name())
+    amp_flag = bool(use_amp and torch.cuda.is_available() and device.type == "cuda")
+    print(f"AMP enabled: {amp_flag}")
 
-    # -------------------------------
-    # Init CSV logs (epoch + summary)
-    # -------------------------------
     (run_dir / "checkpoints").mkdir(parents=True, exist_ok=True)
 
     epoch_file = run_dir / f"epoch_logs_{name}_{balance_mode}.csv"
     summary_file = run_dir / f"summary_{name}_{balance_mode}.csv"
 
     epoch_cols = [
-        "dataset",
-        "model",
-        "origin",
-        "epoch",
-        "split",
-        "loss",
-        "acc",
-        "prec",
-        "rec",
-        "spec",
-        "f1",
-        "ppv",
-        "npv",
-        "lr",
-        "seconds",
+        "dataset", "model", "origin", "epoch", "split",
+        "loss", "acc", "prec", "rec", "spec", "f1", "ppv", "npv",
+        "lr", "seconds",
     ]
     pd.DataFrame(columns=epoch_cols).to_csv(epoch_file, index=False)
 
     summary_cols = [
-        "dataset",
-        "model",
-        "best_epoch",
-        "best_acc",
-        "best_prec",
-        "best_rec",
-        "best_spec",
-        "best_f1",
-        "best_ppv",
-        "best_npv",
+        "dataset", "model",
+        "best_epoch", "best_acc", "best_prec", "best_rec", "best_spec", "best_f1", "best_ppv", "best_npv",
         "fold",
     ]
     pd.DataFrame(columns=summary_cols).to_csv(summary_file, index=False)
@@ -332,51 +313,55 @@ def train_dataset(
     if scheduler_milestones is None:
         scheduler_milestones = SCHEDULER_MILESTONES
 
-    # -------------------------------
-    # Loop over models and folds
-    # -------------------------------
+    # ---- results CSV append helper ----
+    def _append_results(row: dict) -> None:
+        if results_csv is None:
+            return
+        results_csv.parent.mkdir(parents=True, exist_ok=True)
+        file_exists = results_csv.exists() and results_csv.stat().st_size > 0
+        pd.DataFrame([row]).to_csv(results_csv, mode="a", header=not file_exists, index=False)
+
     for friendly_name, backbone_id in models.items():
         for fold in range(num_folds):
+            # per-config timer (model+fold)
+            config_start_dt = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            config_t0 = time.time()
+
             print(f"\n> {name} | {friendly_name} | fold {fold}")
 
-            # --------- 1) loaders + criterion based on balance_mode ---------
+            # --------- loaders + criterion ---------
+            pin = torch.cuda.is_available()
             if balance_mode == "weighted_loader":
-                # WeightedRandomSampler + unweighted CE
                 train_loader, val_loader = get_loaders_weighted(
                     df=train_df,
                     fold=fold,
                     batch_size=batch_size,
                     num_workers=num_workers,
-                    pin_memory=torch.cuda.is_available(),
+                    pin_memory=pin,
                     train_tf=train_tf,
                     val_tf=val_tf,
                 )
                 criterion = nn.CrossEntropyLoss()
-
             else:
-                # Standard loaders
                 train_loader, val_loader = get_loaders(
                     df=train_df,
                     fold=fold,
                     batch_size=batch_size,
                     num_workers=num_workers,
-                    pin_memory=torch.cuda.is_available(),
+                    pin_memory=pin,
                     train_tf=train_tf,
                     val_tf=val_tf,
                 )
-
                 if balance_mode == "weighted_loss":
-                    # compute class weights on TRAIN part of this fold only
                     train_mask = train_df["fold"] != fold
                     train_fold_df = train_df.loc[train_mask]
                     class_weights = compute_class_weights(train_fold_df, device=device)
                     print(f"  Fold {fold}: class weights = {class_weights.tolist()}")
                     criterion = nn.CrossEntropyLoss(weight=class_weights)
                 else:
-                    # balance_mode == "none"
                     criterion = nn.CrossEntropyLoss()
 
-            # --------- 2) model, optimiser, scheduler ---------
+            # --------- model/optim/scheduler/scaler ---------
             model, _, origin = load_any(backbone_id, num_classes=2, pretrained=True)
             model.to(device)
 
@@ -386,29 +371,30 @@ def train_dataset(
                 momentum=momentum,
                 weight_decay=weight_decay,
             )
-            scheduler = MultiStepLR(
-                optimiser, milestones=scheduler_milestones, gamma=scheduler_gamma
-            )
+            scheduler = MultiStepLR(optimiser, milestones=scheduler_milestones, gamma=scheduler_gamma)
 
-            best_val = {
-                k: 0.0 for k in ["acc", "prec", "rec", "spec", "f1", "ppv", "npv"]
-            }
+            scaler = GradScaler("cuda", enabled=amp_flag)
+
+            best_val = {k: 0.0 for k in ["acc", "prec", "rec", "spec", "f1", "ppv", "npv"]}
             best_val["epoch"] = 0
 
-            # --------- 3) epoch loop ---------
+            # --------- epoch loop ---------
             for epoch in range(1, epochs + 1):
                 t0 = time.time()
 
                 train_m = _run_epoch(
-                    train_loader, model, criterion, epoch, "train", optimiser
+                    train_loader, model, criterion, epoch, "train", optimiser,
+                    scaler=scaler, use_amp=use_amp, device=device
                 )
-                val_m = _run_epoch(val_loader, model, criterion, epoch, "val")
+                val_m = _run_epoch(
+                    val_loader, model, criterion, epoch, "val", optimiser=None,
+                    scaler=None, use_amp=use_amp, device=device
+                )
 
                 scheduler.step()
                 duration = time.time() - t0
                 lr_now = scheduler.get_last_lr()[0]
 
-                # per-epoch logging
                 for split_name, m in [("train", train_m), ("val", val_m)]:
                     row_data = OrderedDict(
                         dataset=name,
@@ -427,24 +413,13 @@ def train_dataset(
                         lr=lr_now,
                         seconds=duration,
                     )
-                    pd.DataFrame([row_data]).to_csv(
-                        epoch_file,
-                        mode="a",
-                        header=False,
-                        index=False,
-                    )
+                    pd.DataFrame([row_data]).to_csv(epoch_file, mode="a", header=False, index=False)
 
-                # track best val acc
                 if val_m["acc"] > best_val["acc"]:
                     best_val.update(val_m)
                     best_val["epoch"] = epoch
-                    ckpt_name = (
-                        f"{name}_{backbone_id}_{balance_mode}_best_fold{fold}.pt"
-                    )
-                    torch.save(
-                        model.state_dict(),
-                        run_dir / "checkpoints" / ckpt_name,
-                    )
+                    ckpt_name = f"{name}_{backbone_id}_{balance_mode}_best_fold{fold}.pt"
+                    torch.save(model.state_dict(), run_dir / "checkpoints" / ckpt_name)
 
                 if epoch == 1 or epoch % 5 == 0 or epoch == epochs:
                     print(
@@ -467,26 +442,58 @@ def train_dataset(
                 fold,
             ]
             pd.DataFrame([summary_row], columns=summary_cols).to_csv(
-                summary_file,
-                mode="a",
-                header=False,
-                index=False,
+                summary_file, mode="a", header=False, index=False
             )
 
-            # hygiene
-            del model, optimiser, scheduler, train_loader, val_loader
+            # write per-config timing row
+            config_seconds = time.time() - config_t0
+            config_end_dt = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            gpu_name = torch.cuda.get_device_name() if torch.cuda.is_available() else ""
+
+            _append_results(
+                {
+                    "run_dir": str(run_dir),
+                    "dataset": name,
+                    "balance_mode": balance_mode,
+                    "model": friendly_name,
+                    "backbone_id": backbone_id,
+                    "origin": origin,
+                    "fold": fold,
+                    "config_start": config_start_dt,
+                    "config_end": config_end_dt,
+                    "config_seconds": config_seconds,
+                    "best_epoch": best_val["epoch"],
+                    "best_acc": best_val["acc"],
+                    "best_f1": best_val["f1"],
+                    "device": str(device),
+                    "gpu_name": gpu_name,
+                    "amp": amp_flag,
+                }
+            )
+
+            if callable(progress_cb):
+                progress_cb(
+                    dataset=name,
+                    balance_mode=balance_mode,
+                    model=friendly_name,
+                    backbone_id=backbone_id,
+                    fold=fold,
+                    config_seconds=config_seconds,
+                    run_dir=str(run_dir),
+                )
+
+            del model, optimiser, scheduler, train_loader, val_loader, scaler
             torch.cuda.empty_cache()
             gc.collect()
 
     print(f"\nFinished training on dataset {name}. Logs at: {run_dir}")
 
-
 # ----------------------------
 # Main script
 # ----------------------------
-
-
 def main():
+    import sys
+
     print("\n" + "=" * 70)
     print("FLEXIBLE TRAINING SCRIPT")
     print("=" * 70)
@@ -496,24 +503,60 @@ def main():
     print("  - none            : standard loaders + unweighted loss")
     print("=" * 70 + "\n")
 
-    names = ["apacc", "herlev", "sipakmed"]
-    roots = [
-        Path("./datasets/data/apacc"),
-        Path("./datasets/data/smear2005"),
-        Path("./datasets/data/sipakmed"),
-    ]
-    scanners = [scan_apacc, scan_herlev, scan_sipakmed]
+    run_start_dt = datetime.datetime.now()
+    run_start_str = run_start_dt.strftime("%Y-%m-%d %H:%M:%S")
 
-    # map dataset name -> (train_tf, val_tf)
-    tf_map = {
-        "apacc": (APACC_TRAIN_TF, APACC_VAL_TF),
-        "herlev": (HERLEV_TRAIN_TF, HERLEV_VAL_TF),
-        "sipakmed": (SIPAKMED_TRAIN_TF, SIPAKMED_VAL_TF),
-    }
+    RUNS_DIR.mkdir(parents=True, exist_ok=True)
+    METRICS_DIR.mkdir(parents=True, exist_ok=True)
 
-    balance_modes = ["weighted_loader", "weighted_loss", "none"]
+    log_path = RUNS_DIR / f"terminal_{run_start_dt.strftime('%Y-%m-%d_%H-%M-%S')}.log"
+    results_csv = METRICS_DIR / "training_time_results.csv"
 
-    for root, scanner, name in zip(roots, scanners, names):
+    class _Tee:
+        def __init__(self, *streams, isatty_stream=None):
+            self.streams = streams
+            self._isatty_stream = isatty_stream
+
+        def write(self, data):
+            for s in self.streams:
+                s.write(data)
+                s.flush()
+
+        def flush(self):
+            for s in self.streams:
+                s.flush()
+
+        def isatty(self):
+            if self._isatty_stream is None:
+                return False
+            return bool(getattr(self._isatty_stream, "isatty", lambda: False)())
+
+    log_f = open(log_path, "a", buffering=1, encoding="utf-8")
+    old_stdout, old_stderr = sys.stdout, sys.stderr
+    sys.stdout = _Tee(old_stdout, log_f, isatty_stream=old_stdout)
+    sys.stderr = _Tee(old_stderr, log_f, isatty_stream=old_stderr)
+
+    try:
+        print(f"[START] {run_start_str}")
+        print(f"[LOG]   {log_path}")
+        print(f"[CSV]   {results_csv}")
+
+        names = ["apacc", "herlev", "sipakmed"]
+        roots = [
+            Path("./datasets/data/apacc"),
+            Path("./datasets/data/smear2005"),
+            Path("./datasets/data/sipakmed"),
+        ]
+        scanners = [scan_apacc, scan_herlev, scan_sipakmed]
+
+        tf_map = {
+            "apacc": (APACC_TRAIN_TF, APACC_VAL_TF),
+            "herlev": (HERLEV_TRAIN_TF, HERLEV_VAL_TF),
+            "sipakmed": (SIPAKMED_TRAIN_TF, SIPAKMED_VAL_TF),
+        }
+
+        balance_modes = ["weighted_loader", "weighted_loss", "none"]
+
         models = {
             **{f"EfficientNet-B{i}": f"efficientnet_b{i}" for i in range(7)},
             "SqueezeNet 1.1": "tv_squeezenet1_1",
@@ -523,43 +566,58 @@ def main():
             "GhostNet V3": "ghostnetv3_100.in1k",
         }
 
-        train_tf, val_tf = tf_map[name]
+        total_configs = len(names) * len(balance_modes) * len(models) * NUM_FOLDS
+        done_configs = 0
 
-        print(f"\nScanning dataset: {name} at {root}")
-        df = scanner(root=root, num_folds=NUM_FOLDS, seed=SEED)
+        def progress_cb(**info):
+            nonlocal done_configs
+            done_configs += 1
+            print(f"[PROGRESS] Runned {done_configs}/{total_configs} config models | start={run_start_str}")
 
-        for balance_mode in balance_modes:
-            print("\n" + "-" * 70)
-            print(f"Starting training on {name} with balance_mode = '{balance_mode}'")
-            print("-" * 70 + "\n")
+        for root, scanner, name in zip(roots, scanners, names):
+            train_tf, val_tf = tf_map[name]
 
-            run_dir = _setup_run_dir(
-                METRICS_DIR, dataset_name=name, balance_mode=balance_mode
-            )
+            print(f"\nScanning dataset: {name} at {root}")
+            df = scanner(root=root, num_folds=NUM_FOLDS, seed=SEED)
 
-            train_dataset(
-                name=name,
-                df=df,
-                run_dir=run_dir,
-                models=models,
-                balance_mode=balance_mode,
-                num_folds=NUM_FOLDS,
-                batch_size=BATCH_SIZE,
-                num_workers=NUM_WORKERS,
-                epochs=EPOCHS,
-                lr=LR,
-                momentum=MOMENTUM,
-                weight_decay=WEIGHT_DECAY,
-                scheduler_milestones=SCHEDULER_MILESTONES,
-                scheduler_gamma=SCHEDULER_GAMMA,
-                device=DEVICE,
-                train_tf=train_tf,
-                val_tf=val_tf,
-            )
+            for balance_mode in balance_modes:
+                print("\n" + "-" * 70)
+                print(f"Starting training on {name} with balance_mode = '{balance_mode}'")
+                print("-" * 70 + "\n")
 
-    print("\n" + "=" * 70)
-    print("MOCK TRAINING COMPLETE (all datasets, all balance modes)")
-    print("=" * 70 + "\n")
+                run_dir = _setup_run_dir(METRICS_DIR, dataset_name=name, balance_mode=balance_mode)
+
+                train_dataset(
+                    name=name,
+                    df=df,
+                    run_dir=run_dir,
+                    models=models,
+                    balance_mode=balance_mode,
+                    num_folds=NUM_FOLDS,
+                    batch_size=BATCH_SIZE,
+                    num_workers=NUM_WORKERS,
+                    epochs=EPOCHS,
+                    lr=LR,
+                    momentum=MOMENTUM,
+                    weight_decay=WEIGHT_DECAY,
+                    scheduler_milestones=SCHEDULER_MILESTONES,
+                    scheduler_gamma=SCHEDULER_GAMMA,
+                    device=DEVICE,
+                    train_tf=train_tf,
+                    val_tf=val_tf,
+                    use_amp=True,
+                    results_csv=results_csv,
+                    progress_cb=progress_cb,
+                )
+
+        print("\n" + "=" * 70)
+        print("TRAINING COMPLETE (all datasets, all balance modes)")
+        print("=" * 70 + "\n")
+
+    finally:
+        sys.stdout = old_stdout
+        sys.stderr = old_stderr
+        log_f.close()
 
 
 if __name__ == "__main__":

@@ -19,6 +19,7 @@ from datasets.datasets import (
     scan_apacc,
     get_loaders,
     get_loaders_weighted,
+    merge_train_dev_with_folds,
     make_tf_from_stats_for_fold,
     NORM_STATS_PATH,
 )
@@ -246,8 +247,7 @@ def train_dataset(
     progress_cb=None,  # callable(**info)
 ) -> None:
     """
-    When stats_path is set, per-fold normalization is loaded from the JSON
-    (no leakage). Otherwise train_tf/val_tf must be provided.
+    When stats_path is set, per-fold normalization is loaded from the JSON (no leakage).
     NEW:
       - AMP support (use_amp=True) for speed on CUDA
       - Metrics computed accurately on GPU via TP/TN/FP/FN accumulation (no sklearn)
@@ -557,13 +557,22 @@ def main():
         print(f"[LOG]   {log_path}")
         print(f"[CSV]   {results_csv}")
 
-        names = ["apacc", "herlev", "sipakmed"]
-        roots = [
-            Path("./datasets/data/apacc"),
-            Path("./datasets/data/smear2005"),
-            Path("./datasets/data/sipakmed"),
+        # Mixed-dataset: (combined_name, [train_name_a, train_name_b], test_name)
+        combinations = [
+            ("apacc_sipakmed", ["apacc", "sipakmed"], "herlev"),
+            ("herlev_sipakmed", ["herlev", "sipakmed"], "apacc"),
+            ("herlev_apacc", ["herlev", "apacc"], "sipakmed"),
         ]
-        scanners = [scan_apacc, scan_herlev, scan_sipakmed]
+        roots = {
+            "apacc": Path("./datasets/data/apacc"),
+            "herlev": Path("./datasets/data/smear2005"),
+            "sipakmed": Path("./datasets/data/sipakmed"),
+        }
+        scanners = {
+            "apacc": scan_apacc,
+            "herlev": scan_herlev,
+            "sipakmed": scan_sipakmed,
+        }
 
         balance_modes = ["weighted_loader", "weighted_loss", "none"]
 
@@ -576,7 +585,7 @@ def main():
             "GhostNet V3": "ghostnetv3_100.in1k",
         }
 
-        total_configs = len(names) * len(balance_modes) * len(models) * NUM_FOLDS
+        total_configs = len(combinations) * len(balance_modes) * len(models) * NUM_FOLDS
         done_configs = 0
 
         def progress_cb(**info):
@@ -584,23 +593,41 @@ def main():
             done_configs += 1
             print(f"[PROGRESS] Runned {done_configs}/{total_configs} config models | start={run_start_str}")
 
-        for root, scanner, name in zip(roots, scanners, names):
-            print(f"\nScanning dataset: {name} at {root}")
-            if name == "apacc":
-                df = scanner(root=root, num_folds=NUM_FOLDS, seed=SEED)
-            else:
-                df = scanner(root=root, num_folds=NUM_FOLDS, seed=SEED, test_size=0.2)
+        for combined_name, train_names, test_name in combinations:
+            print(f"\nCombination: train on {' + '.join(train_names)}, test on {test_name}")
+
+            # Load full DataFrames for the two training datasets
+            dfs_to_merge = []
+            for name in train_names:
+                root = roots[name]
+                scanner = scanners[name]
+                print(f"  Scanning {name} at {root}")
+                if name == "apacc":
+                    df_part = scanner(root=root, num_folds=NUM_FOLDS, seed=SEED)
+                else:
+                    df_part = scanner(root=root, num_folds=NUM_FOLDS, seed=SEED, test_size=0.2)
+                dfs_to_merge.append(df_part)
+
+            use_group = "sipakmed" in train_names
+            merged_df = merge_train_dev_with_folds(
+                dfs_to_merge,
+                num_folds=NUM_FOLDS,
+                seed=SEED,
+                group_column="cluster_id" if use_group else None,
+                name_prefixes=train_names,
+            )
+            print(f"  Merged train_dev size: {len(merged_df)}")
 
             for balance_mode in balance_modes:
                 print("\n" + "-" * 70)
-                print(f"Starting training on {name} with balance_mode = '{balance_mode}'")
+                print(f"Starting training on {combined_name} with balance_mode = '{balance_mode}'")
                 print("-" * 70 + "\n")
 
-                run_dir = _setup_run_dir(METRICS_DIR, dataset_name=name, balance_mode=balance_mode)
+                run_dir = _setup_run_dir(METRICS_DIR, dataset_name=combined_name, balance_mode=balance_mode)
 
                 train_dataset(
-                    name=name,
-                    df=df,
+                    name=combined_name,
+                    df=merged_df,
                     run_dir=run_dir,
                     models=models,
                     balance_mode=balance_mode,
@@ -621,7 +648,7 @@ def main():
                 )
 
         print("\n" + "=" * 70)
-        print("TRAINING COMPLETE (all datasets, all balance modes)")
+        print("MIXED-DATASET TRAINING COMPLETE (all combinations, all balance modes)")
         print("=" * 70 + "\n")
 
     finally:

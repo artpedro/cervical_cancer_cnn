@@ -1,7 +1,6 @@
-import os
 import json
 from pathlib import Path
-from typing import Tuple, Dict, List, Optional
+from typing import Tuple, List, Optional
 from tqdm.auto import tqdm
 import numpy as np
 import pandas as pd
@@ -41,8 +40,8 @@ ABNORMAL = {
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD = [0.229, 0.224, 0.225]
 
-# Path to JSON file where per-dataset normalization stats are stored
-NORM_STATS_PATH = Path("./datasets/normalization_stats.json")
+# Path to JSON file where per-dataset normalization stats are stored (package-relative so cwd-independent)
+NORM_STATS_PATH = Path(__file__).resolve().parent / "normalization_stats.json"
 
 # ============================================================
 # TRANSFORM BUILDERS
@@ -282,6 +281,100 @@ def make_tf_from_stats(
     )
     normalizing_matriz = [mean, std]
     return make_tf(normalizing_matriz=normalizing_matriz)
+
+
+def make_tf_from_stats_for_fold(
+    dataset_name: str,
+    fold: int,
+    stats_path: Path,
+) -> tuple[T.Compose, T.Compose]:
+    """
+    Build (train_tf, eval_tf) using normalization stats for a specific fold
+    from the pre-populated JSON. Use this in CV to avoid leakage: each fold
+    uses stats computed only on that fold's training portion.
+
+    Expects stats to be stored as stats[dataset_name]["fold_0"], ["fold_1"], ...
+    with "mean" and "std" in each. Run get_normalize.py to populate the file.
+
+    Parameters
+    ----------
+    dataset_name : str
+        Key in the JSON (e.g. "herlev", "apacc_sipakmed").
+    fold : int
+        Fold index (0 to num_folds-1).
+    stats_path : Path
+        Path to normalization_stats.json.
+
+    Returns
+    -------
+    train_tf, eval_tf
+    """
+    stats_path = Path(stats_path)
+    if not stats_path.exists():
+        raise FileNotFoundError(
+            f"Normalization stats not found at {stats_path}. "
+            "Run: python -m datasets.get_normalize"
+        )
+    with stats_path.open("r") as f:
+        stats = json.load(f)
+    fold_key = f"fold_{fold}"
+    if dataset_name not in stats or fold_key not in stats[dataset_name]:
+        raise KeyError(
+            f"Stats for dataset={dataset_name!r}, fold={fold_key!r} not in {stats_path}. "
+            "Run: python -m datasets.get_normalize"
+        )
+    entry = stats[dataset_name][fold_key]
+    mean = entry["mean"]
+    std = entry["std"]
+    return make_tf(normalizing_matriz=[mean, std])
+
+
+def make_tf_from_stats_full(
+    dataset_name: str,
+    stats_path: Path,
+) -> tuple[T.Compose, T.Compose]:
+    """
+    Build (train_tf, eval_tf) using normalization stats for the full train_dev set
+    from the pre-populated JSON. Use for full-dataset training and for
+    cross-dataset evaluation (normalize target with source's full-train stats).
+
+    Expects stats[dataset_name]["full"] with "mean" and "std". Run get_normalize.py
+    to populate the file.
+
+    Parameters
+    ----------
+    dataset_name : str
+        Key in the JSON (e.g. "herlev", "apacc_sipakmed").
+    stats_path : Path
+        Path to normalization_stats.json.
+
+    Returns
+    -------
+    train_tf, eval_tf
+    """
+    stats_path = Path(stats_path)
+    if not stats_path.exists():
+        raise FileNotFoundError(
+            f"Normalization stats not found at {stats_path}. "
+            "Run: python -m datasets.get_normalize"
+        )
+    with stats_path.open("r") as f:
+        stats = json.load(f)
+    # Prefer "full"; fallback to "train_dev" for backward compatibility with older JSON
+    if dataset_name not in stats:
+        raise KeyError(
+            f"Stats for dataset={dataset_name!r} not in {stats_path}. "
+            "Run: python -m datasets.get_normalize"
+        )
+    entry = stats[dataset_name].get("full") or stats[dataset_name].get("train_dev")
+    if entry is None:
+        raise KeyError(
+            f"Stats for dataset={dataset_name!r}, key 'full' or 'train_dev' not in {stats_path}. "
+            "Run: python -m datasets.get_normalize"
+        )
+    mean = entry["mean"]
+    std = entry["std"]
+    return make_tf(normalizing_matriz=[mean, std])
 
 
 # ============================================================
@@ -540,6 +633,99 @@ def scan_apacc(
         df.loc[real_idx, "fold"] = fold
 
     return df
+
+
+# ============================================================
+# MERGE TRAIN_DEV FOR MIXED-DATASET TRAINING
+# ============================================================
+
+def merge_train_dev_with_folds(
+    df_list: List[pd.DataFrame],
+    num_folds: int,
+    seed: int,
+    *,
+    group_column: Optional[str] = None,
+    name_prefixes: Optional[List[str]] = None,
+) -> pd.DataFrame:
+    """
+    Merge train_dev portions of two (or more) dataset DataFrames and assign
+    new stratified folds on the combined set. When group_column is provided
+    (e.g. "cluster_id" for Sipakmed), uses StratifiedGroupKFold so that
+    groups (e.g. clusters) are not split across train/val.
+
+    Parameters
+    ----------
+    df_list : list of pd.DataFrame
+        Each DataFrame from a scanner, with at least path, binary_idx, split.
+        Sipakmed has cluster_id; Apacc/Herlev do not.
+    num_folds : int
+        Number of folds for the combined train_dev.
+    seed : int
+        Random seed for fold assignment.
+    group_column : str or None
+        If provided (e.g. "cluster_id"), build a unified group_id: use that
+        column where present, else per-image id (path with prefix) so that
+        StratifiedGroupKFold keeps groups together.
+    name_prefixes : list of str or None
+        Optional prefixes per df in df_list, used for per-image group_id when
+        group_column is missing in that df. If None, uses "df0", "df1", ...
+
+    Returns
+    -------
+    pd.DataFrame
+        Single DataFrame with path, binary_idx, split ("train_dev"), fold
+        (0..num_folds-1), and label_full/binary_label if present in all.
+    """
+    if not df_list:
+        raise ValueError("df_list must contain at least one DataFrame")
+    if name_prefixes is not None and len(name_prefixes) != len(df_list):
+        raise ValueError("name_prefixes length must match df_list")
+
+    required = {"path", "binary_idx", "split"}
+    pieces = []
+    for i, df in enumerate(df_list):
+        if not required.issubset(df.columns):
+            raise ValueError(f"DataFrame {i} missing required columns {required - set(df.columns)}")
+        train_dev = df[df["split"] == "train_dev"].copy()
+        if train_dev.empty:
+            continue
+        prefix = (name_prefixes[i] if name_prefixes else f"df{i}")
+        # Unified group_id: for group-aware folding, use group_column where present else per-image id
+        if group_column is not None:
+            if group_column in train_dev.columns:
+                train_dev["group_id"] = train_dev[group_column].astype(str)
+            else:
+                train_dev["group_id"] = prefix + "_" + train_dev["path"].astype(str)
+        pieces.append(train_dev)
+
+    if not pieces:
+        raise ValueError("No train_dev rows found in any DataFrame")
+    combined = pd.concat(pieces, axis=0, ignore_index=True)
+
+    # Common columns for output: require path, binary_idx, split, fold; keep label_full/binary_label if present
+    out_cols = ["path", "binary_idx", "split", "fold"]
+    for c in ("label_full", "binary_label"):
+        if c in combined.columns:
+            out_cols.append(c)
+    if group_column is not None and "group_id" in combined.columns:
+        groups = combined["group_id"].to_numpy()
+        y = combined["binary_idx"].to_numpy()
+        sgkf = StratifiedGroupKFold(n_splits=num_folds, shuffle=True, random_state=seed)
+        combined["fold"] = -1
+        for fold_idx, (_, val_indices) in enumerate(sgkf.split(X=combined, y=y, groups=groups)):
+            combined.iloc[val_indices, combined.columns.get_loc("fold")] = fold_idx
+    else:
+        train_dev_idx = combined.index.to_numpy()
+        train_dev_labels = combined["binary_idx"].to_numpy()
+        skf = StratifiedKFold(n_splits=num_folds, shuffle=True, random_state=seed)
+        combined["fold"] = -1
+        for fold_idx, (_, val_rel_idx) in enumerate(skf.split(train_dev_idx, train_dev_labels)):
+            val_idx = train_dev_idx[val_rel_idx]
+            combined.loc[val_idx, "fold"] = fold_idx
+
+    combined["split"] = "train_dev"
+    result = combined[[c for c in out_cols if c in combined.columns]].copy()
+    return result.reset_index(drop=True)
 
 
 # ============================================================

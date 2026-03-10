@@ -1,101 +1,139 @@
 #!/usr/bin/env python
+"""
+Populate datasets/normalization_stats.json with per-fold mean/std for each
+dataset and each mixed-dataset combination. Stats for fold_k are computed
+only on the training portion of that fold (train_dev rows with fold != k),
+so cross-validation does not leak validation data into normalization.
+
+Run from project root: python -m datasets.get_normalize
+"""
 from __future__ import annotations
-import importlib, random, yaml
+
+import json
+import random
 from pathlib import Path
 
 import numpy as np
 import torch
-import torchvision.transforms as T
-from torch.utils.data import DataLoader
-from tqdm import tqdm
 
-# ─────────── configuration ────────────
+from datasets.datasets import (
+    NORM_STATS_PATH,
+    scan_apacc,
+    scan_herlev,
+    scan_sipakmed,
+    merge_train_dev_with_folds,
+    compute_mean_std_for_df,
+)
+
+# ─────────── configuration (match train_models / train_models_mixed) ───────────
 SEED = 42
-DATASETS = {
-    "apacc": {"root": r"apacc", "module": "apacc",    "num_folds": 5},
-    "herlev"  : {"root": r"herlev",   "module": "herlev","num_folds": 5},
-    "sipakmed"   : {"root": r"sipakmed",    "module": "sipakmed", "num_folds": 5},
+NUM_FOLDS = 5
+TEST_SIZE = 0.2
+
+ROOTS = {
+    "apacc": Path("./datasets/data/apacc"),
+    "herlev": Path("./datasets/data/smear2005"),
+    "sipakmed": Path("./datasets/data/sipakmed"),
 }
-OUT_YAML = Path(".\dataset_stats_entire.yaml")
-NUM_WORKERS = 4            # set 0 to avoid multiprocessing entirely
-# ──────────────────────────────────────
 
+COMBINATIONS = [
+    ("apacc_sipakmed", ["apacc", "sipakmed"]),
+    ("herlev_sipakmed", ["herlev", "sipakmed"]),
+    ("herlev_apacc", ["herlev", "apacc"]),
+]
+# ─────────────────────────────────────────────────────────────────────────────
 
-def without_normalize(tf: T.Compose) -> T.Compose:
-    ops = list(tf.transforms)
-    if ops and isinstance(ops[-1], T.Normalize):
-        ops = ops[:-1]
-    return T.Compose(ops)
-
-
-def calc_mean_std(loader, device="cuda"):
-    n_pix  = 0
-    c_sum  = torch.zeros(3, dtype=torch.float64, device=device)
-    c_sq   = torch.zeros(3, dtype=torch.float64, device=device)
-
-    with torch.no_grad():
-        for batch, _ in tqdm(loader, leave=False):
-            batch = batch.to(device, non_blocking=True)       # B×C×H×W
-            b, c, h, w = batch.shape
-            n_pix  += b * h * w
-            c_sum  += batch.sum(dim=[0, 2, 3])
-            c_sq   += (batch ** 2).sum(dim=[0, 2, 3])
-
-    mean = c_sum / n_pix                    # still on GPU
-    std  = torch.sqrt(c_sq / n_pix - mean ** 2)
-
-    return mean.cpu().tolist(), std.cpu().tolist()
 
 def main() -> None:
-    # reproducible RNG
-    random.seed(SEED); np.random.seed(SEED); torch.manual_seed(SEED)
-    torch.backends.cudnn.deterministic = True; torch.backends.cudnn.benchmark = False
+    random.seed(SEED)
+    np.random.seed(SEED)
+    torch.manual_seed(SEED)
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    stats: dict[str, dict] = {}
+    stats_path = Path(NORM_STATS_PATH)
+    stats_path.parent.mkdir(parents=True, exist_ok=True)
+    if stats_path.exists():
+        with stats_path.open("r") as f:
+            stats = json.load(f)
+    else:
+        stats = {}
 
-    for nick, cfg in DATASETS.items():
-        print(f"\n▶  {nick}")
-        mod = importlib.import_module(cfg["module"])
+    scanners = {
+        "apacc": lambda: scan_apacc(ROOTS["apacc"], num_folds=NUM_FOLDS, seed=SEED),
+        "herlev": lambda: scan_herlev(
+            ROOTS["herlev"], num_folds=NUM_FOLDS, seed=SEED, test_size=TEST_SIZE
+        ),
+        "sipakmed": lambda: scan_sipakmed(
+            ROOTS["sipakmed"], num_folds=NUM_FOLDS, seed=SEED, test_size=TEST_SIZE
+        ),
+    }
 
-        # scan function
-        scan_fn = next(getattr(mod, n) for n in dir(mod) if n.startswith("scan"))
-        df = scan_fn(Path(cfg["root"]), num_folds=cfg["num_folds"], seed=SEED)
+    # ─── Single datasets: per-fold stats (training portion only) ───
+    for name, scan in scanners.items():
+        print(f"\n>> {name}")
+        df = scan()
+        train_dev = df[df["split"] == "train_dev"]
+        if name not in stats:
+            stats[name] = {}
+        for fold in range(NUM_FOLDS):
+            train_only = train_dev[train_dev["fold"] != fold]
+            if train_only.empty:
+                raise RuntimeError(f"{name} fold {fold}: no training rows")
+            mean, std = compute_mean_std_for_df(
+                train_only.reset_index(drop=True),
+                show_progress=(fold == 0),
+            )
+            stats[name][f"fold_{fold}"] = {"mean": mean, "std": std}
+            if fold == 0:
+                print(f"   fold_0 mean: {mean}")
+                print(f"   fold_0 std:  {std}")
 
-        # dataset class (module-stem + 'Dataset')
-        stem = cfg["module"].split(".")[-1]
-        dataset_cls = next(v for k, v in vars(mod).items()
-                           if k.lower().startswith(stem) and k.endswith("Dataset"))
+        # Full train_dev stats (for full-dataset training and cross-dataset evaluation)
+        full_train_dev = train_dev.reset_index(drop=True)
+        mean_full, std_full = compute_mean_std_for_df(full_train_dev, show_progress=False)
+        stats[name]["full"] = {"mean": mean_full, "std": std_full}
+        print(f"   full (train_dev) mean: {mean_full}")
+        print(f"   full (train_dev) std:  {std_full}")
 
-        # deterministic transform (eval tf w/o Normalize)
-        if hasattr(mod, "val_tf"):
-            stat_tf = without_normalize(mod.val_tf)
-        elif hasattr(mod, "eval_tf"):
-            stat_tf = without_normalize(mod.eval_tf)
-        else:  # fallback
-            stat_tf = T.Compose([T.Resize(256), T.CenterCrop(224), T.ToTensor()])
-
-        # choose rows
-        df_train = df[df["split"] == "train"] if "split" in df.columns else df
-
-        loader = DataLoader(
-            dataset_cls(df_train.reset_index(drop=True), stat_tf),
-            batch_size=128,
-            shuffle=False,
-            num_workers=NUM_WORKERS,
-            pin_memory=True,
+    # ─── Mixed datasets: per-fold stats (training portion only) ───
+    for combined_name, train_names in COMBINATIONS:
+        print(f"\n>> {combined_name}")
+        dfs_to_merge = []
+        for name in train_names:
+            dfs_to_merge.append(scanners[name]())
+        use_group = "sipakmed" in train_names
+        merged_df = merge_train_dev_with_folds(
+            dfs_to_merge,
+            num_folds=NUM_FOLDS,
+            seed=SEED,
+            group_column="cluster_id" if use_group else None,
+            name_prefixes=train_names,
         )
+        if combined_name not in stats:
+            stats[combined_name] = {}
+        for fold in range(NUM_FOLDS):
+            train_only = merged_df[merged_df["fold"] != fold]
+            if train_only.empty:
+                raise RuntimeError(f"{combined_name} fold {fold}: no training rows")
+            mean, std = compute_mean_std_for_df(
+                train_only.reset_index(drop=True),
+                show_progress=(fold == 0),
+            )
+            stats[combined_name][f"fold_{fold}"] = {"mean": mean, "std": std}
+            if fold == 0:
+                print(f"   fold_0 mean: {mean}")
+                print(f"   fold_0 std:  {std}")
 
-        mean, std = calc_mean_std(loader, device=device)
-        stats[nick] = {"mean": mean, "std": std}
-        print("   mean :", mean)
-        print("   std  :", std)
+        # Full merged train_dev stats (for full-dataset training and cross-dataset evaluation)
+        mean_full, std_full = compute_mean_std_for_df(merged_df.reset_index(drop=True), show_progress=False)
+        stats[combined_name]["full"] = {"mean": mean_full, "std": std_full}
+        print(f"   full (train_dev) mean: {mean_full}")
+        print(f"   full (train_dev) std:  {std_full}")
 
-    with OUT_YAML.open("w") as f:
-        yaml.safe_dump(stats, f, sort_keys=False)
-    print(f"\n📄  Statistics written to {OUT_YAML.resolve()}")
+    with stats_path.open("w") as f:
+        json.dump(stats, f, indent=2)
+
+    print(f"\nNormalization stats written to {stats_path.resolve()}")
 
 
-# Windows (spawn) requires the guard so that worker processes can import this file
 if __name__ == "__main__":
     main()

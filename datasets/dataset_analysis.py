@@ -11,16 +11,12 @@ import torch
 from torch.utils.data import DataLoader
 import torchvision.transforms as T
 
-from datasets import (
+from datasets.datasets import (
     scan_sipakmed,
     scan_herlev,
     scan_apacc,
-    HERLEV_TRAIN_TF,
-    HERLEV_VAL_TF,
-    SIPAKMED_TRAIN_TF,
-    SIPAKMED_VAL_TF,
-    APACC_TRAIN_TF,
-    APACC_VAL_TF,
+    make_tf_from_stats_full,
+    NORM_STATS_PATH,
     get_loaders_weighted,
 )
 
@@ -204,20 +200,18 @@ def main() -> None:
 
     scanners = [scan_sipakmed, scan_herlev, scan_apacc]
 
-    all_tfs = [
-        (HERLEV_TRAIN_TF, HERLEV_VAL_TF),
-        (SIPAKMED_TRAIN_TF, SIPAKMED_VAL_TF),
-        (APACC_TRAIN_TF, APACC_VAL_TF),
-    ]
-
-    for name, root, scanner, tfs in zip(names, roots, scanners, all_tfs):
+    # Transforms from normalization_stats.json "full" key (run: python -m datasets.get_normalize)
+    for name, root, scanner in zip(names, roots, scanners):
         print(f"\n==================== {name.upper()} ====================")
 
-        df = scanner(root, num_folds=NUM_FOLDS, seed=SEED)
+        if name == "apacc":
+            df = scanner(root, num_folds=NUM_FOLDS, seed=SEED)
+        else:
+            df = scanner(root, num_folds=NUM_FOLDS, seed=SEED, test_size=0.2)
 
         # 1) class balance
         report_class_balance(df, NUM_FOLDS)
-        train_tf, val_tf = tfs
+        train_tf, val_tf = make_tf_from_stats_full(name, NORM_STATS_PATH)
 
         train_tf_no_norm = without_normalize(train_tf)  # uses your Resize/Crop/Jitter…
         val_tf_no_norm = without_normalize(val_tf)

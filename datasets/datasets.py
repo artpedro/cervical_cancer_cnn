@@ -871,7 +871,7 @@ def get_loaders(
     fold: int,
     *,
     batch_size: int,
-    num_workers: int = 4,
+    num_workers: int = 6,
     pin_memory: bool = True,
     train_tf: T.Compose,
     val_tf: T.Compose,
